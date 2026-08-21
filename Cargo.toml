@@ -1,0 +1,27 @@
+[package]
+name = "icp-js-plugin"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "An icp-cli sync plugin that runs a JavaScript script against the canister being synced"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+candid = "0.10"
+candid_parser = "0.4"
+hex = "0.4"
+rquickjs = { version = "0.12", default-features = false, features = [
+    "macro",
+    "classes",
+    "properties",
+    "array-buffer",
+] }
+sha2 = "0.10"
+wit-bindgen = { version = "0.56", features = ["realloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
