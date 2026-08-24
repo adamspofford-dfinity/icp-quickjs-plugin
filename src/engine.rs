@@ -9,11 +9,13 @@ use rquickjs::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::candid;
+use crate::candid::{self, arg_bytes};
+use crate::convert;
 use crate::icp::sync_plugin::types::{CallTarget, CallType};
-use crate::number;
+use crate::interface::SelfTarget;
 use crate::principal::{self, Principal};
 use crate::{CanisterCallRequest, SyncExecInput, canister_call};
+use crate::{exact, interface, number};
 
 /// Run the entry script with all capabilities wired in. Returns the plugin's
 /// `exec` result: `Ok(())` on a clean run, or a human-readable error string on
@@ -75,9 +77,11 @@ fn entry_script(input: &SyncExecInput) -> Result<(String, String), String> {
 fn install(ctx: &Ctx<'_>, input: &SyncExecInput) -> JsResult<()> {
     principal::register(ctx)?;
     number::register(ctx)?;
+    exact::register(ctx)?;
     register_output(ctx)?;
     register_canister_calls(ctx)?;
     candid::register(ctx)?;
+    interface::register(ctx)?;
     register_encoding(ctx)?;
     register_fs(ctx)?;
     inject_inputs(ctx, input)?;
@@ -142,17 +146,17 @@ fn register_canister_calls(ctx: &Ctx<'_>) -> JsResult<()> {
 /// `canisterCall({ method, arg, query, direct, cycles, target })`.
 /// Only `method` is required; the rest default to an empty-arg update call to
 /// the canister being synced, routed through the proxy (if configured) with no
-/// cycles. `target` selects a declared-dependency canister (see [`map_target`]);
-/// omitted, it targets the canister being synced.
+/// cycles. `target` names a canister listed in the step's `canisters:` (see
+/// [`resolve_target`]); omitted, it targets the canister being synced.
 fn canister_call_js<'js>(ctx: Ctx<'js>, opts: Object<'js>) -> JsResult<TypedArray<'js, u8>> {
     let method: String = match opts.get::<_, Option<String>>("method")? {
         Some(m) => m,
-        None => return Err(throw(&ctx, "canister_call: missing required `method`")),
+        None => return Err(throw(&ctx, "canisterCall: missing required `method`")),
     };
 
-    let arg = match opts.get::<_, Option<TypedArray<'js, u8>>>("arg")? {
-        Some(a) => bytes_of(&ctx, "arg", &a)?,
-        None => Vec::new(),
+    let arg = match opts.get::<_, Option<Value<'js>>>("arg")? {
+        Some(a) if !a.is_null() && !a.is_undefined() => arg_bytes(&ctx, "canisterCall `arg`", &a)?,
+        _ => Vec::new(),
     };
 
     let call_type = if opts.get::<_, Option<bool>>("query")?.unwrap_or(false) {
@@ -161,8 +165,9 @@ fn canister_call_js<'js>(ctx: Ctx<'js>, opts: Object<'js>) -> JsResult<TypedArra
         CallType::Update
     };
     let direct = opts.get::<_, Option<bool>>("direct")?.unwrap_or(false);
-    let cycles = map_cycles(&ctx, &opts)?;
-    let target = map_target(&ctx, &opts)?;
+    let cycles = map_cycles(&ctx, &opts, "canisterCall")?;
+    let target = opts.get::<_, Option<Value<'js>>>("target")?;
+    let (target, _) = resolve_target(&ctx, target.as_ref(), "canisterCall")?;
 
     host_call(&ctx, target, method, arg, call_type, direct, cycles)
 }
@@ -170,9 +175,9 @@ fn canister_call_js<'js>(ctx: Ctx<'js>, opts: Object<'js>) -> JsResult<TypedArra
 fn call_update_js<'js>(
     ctx: Ctx<'js>,
     method: String,
-    arg: TypedArray<'js, u8>,
+    arg: Value<'js>,
 ) -> JsResult<TypedArray<'js, u8>> {
-    let arg = bytes_of(&ctx, "arg", &arg)?;
+    let arg = arg_bytes(&ctx, "callUpdate `arg`", &arg)?;
     host_call(
         &ctx,
         CallTarget::Host,
@@ -187,9 +192,9 @@ fn call_update_js<'js>(
 fn call_query_js<'js>(
     ctx: Ctx<'js>,
     method: String,
-    arg: TypedArray<'js, u8>,
+    arg: Value<'js>,
 ) -> JsResult<TypedArray<'js, u8>> {
-    let arg = bytes_of(&ctx, "arg", &arg)?;
+    let arg = arg_bytes(&ctx, "callQuery `arg`", &arg)?;
     host_call(
         &ctx,
         CallTarget::Host,
@@ -201,15 +206,15 @@ fn call_query_js<'js>(
     )
 }
 
-/// An update call to a declared-dependency canister, by the name the manifest
-/// spells it with.
+/// An update call to another canister listed in the sync step's `canisters:`,
+/// by the name the manifest spells it with.
 fn call_other_js<'js>(
     ctx: Ctx<'js>,
     name: String,
     method: String,
-    arg: TypedArray<'js, u8>,
+    arg: Value<'js>,
 ) -> JsResult<TypedArray<'js, u8>> {
-    let arg = bytes_of(&ctx, "arg", &arg)?;
+    let arg = arg_bytes(&ctx, "callOther `arg`", &arg)?;
     host_call(
         &ctx,
         CallTarget::Name(name),
@@ -247,46 +252,90 @@ fn host_call<'js>(
 }
 
 /// Read the optional `cycles` field (a non-negative integer) from the options.
-fn map_cycles(ctx: &Ctx<'_>, opts: &Object<'_>) -> JsResult<u64> {
+pub(crate) fn map_cycles(ctx: &Ctx<'_>, opts: &Object<'_>, what: &str) -> JsResult<u64> {
     match opts.get::<_, Option<i64>>("cycles")? {
-        Some(n) => {
-            u64::try_from(n).map_err(|_| throw(ctx, "canisterCall: `cycles` must be non-negative"))
-        }
+        Some(n) => u64::try_from(n)
+            .map_err(|_| throw(ctx, &format!("{what}: `cycles` must be non-negative"))),
         None => Ok(0),
     }
 }
 
-/// Resolve the optional `target` field into a [`CallTarget`].
+/// Resolve a script-provided target into a [`CallTarget`] and a description of
+/// it for error messages.
 ///
-/// Missing (or null/undefined) targets the canister being synced. A `Principal`
-/// targets that canister by its textual principal. A string is resolved the same
-/// way the manifest's `canisters:` list is: if it parses as a principal it
-/// targets by id, otherwise it is treated as a canister name. The target must
-/// have been declared as a dependency in the sync step's `canisters` list, or
-/// the host rejects the call.
-fn map_target(ctx: &Ctx<'_>, opts: &Object<'_>) -> JsResult<CallTarget> {
-    let Some(v) = opts.get::<_, Option<Value<'_>>>("target")? else {
-        return Ok(CallTarget::Host);
+/// `self`, a missing target and `null` are all the canister being synced.
+/// Anything else names a canister, spelled exactly as the sync step's
+/// `canisters:` list does — a bare local name for a canister in the same
+/// subproject, or a `subproject:local` key otherwise. The host resolves that
+/// name and rejects a target the step did not list.
+///
+/// A principal is not a target: the host takes names only, so that the
+/// permission it checks is the one the manifest granted. When the principal is
+/// one the project knows, the error says which name to write instead.
+pub(crate) fn resolve_target<'js>(
+    ctx: &Ctx<'js>,
+    target: Option<&Value<'js>>,
+    what: &str,
+) -> JsResult<(CallTarget, String)> {
+    let host = || (CallTarget::Host, "the canister being synced".to_string());
+    let Some(value) = target else {
+        return Ok(host());
     };
-    if v.is_null() || v.is_undefined() {
-        return Ok(CallTarget::Host);
+    if value.is_null() || value.is_undefined() {
+        return Ok(host());
     }
-    if let Ok(p) = Class::<Principal>::from_value(&v) {
-        return Ok(CallTarget::Id(p.borrow().inner.to_text()));
+    if Class::<SelfTarget>::from_value(value).is_ok() {
+        return Ok(host());
     }
-    let text = match v.get::<String>() {
-        Ok(t) => t,
-        Err(_) => {
+
+    let text = match value.as_string() {
+        Some(text) => text.to_string()?,
+        None => {
+            let named = convert::principal_of(value)
+                .ok()
+                .map(|p| p.to_text())
+                .unwrap_or_default();
             return Err(throw(
                 ctx,
-                "canisterCall: `target` must be a string or Principal",
+                &format!(
+                    "{what}: a target is `self` or the name of a canister listed in the step's \
+                     `canisters:`, got {}{}",
+                    convert::type_name(value),
+                    name_hint(ctx, &named),
+                ),
             ));
         }
     };
-    Ok(match CandidPrincipal::from_text(&text) {
-        Ok(p) => CallTarget::Id(p.to_text()),
-        Err(_) => CallTarget::Name(text),
-    })
+    if CandidPrincipal::from_text(&text).is_ok() {
+        return Err(throw(
+            ctx,
+            &format!(
+                "{what}: a target is `self` or the name of a canister listed in the step's \
+                 `canisters:`, not the principal '{text}'{}",
+                name_hint(ctx, &text),
+            ),
+        ));
+    }
+    Ok((CallTarget::Name(text.clone()), format!("canister {text}")))
+}
+
+/// The name the project knows a principal by, if it knows one, so an error
+/// about a principal target can say what to write instead.
+fn name_hint(ctx: &Ctx<'_>, principal: &str) -> String {
+    if principal.is_empty() {
+        return String::new();
+    }
+    let Ok(ids) = ctx.globals().get::<_, Object<'_>>("canisterIds") else {
+        return String::new();
+    };
+    let found = ids
+        .props::<String, String>()
+        .flatten()
+        .find(|(_, id)| id == principal);
+    match found {
+        Some((name, _)) => format!("; the project calls that canister '{name}'"),
+        None => String::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +347,10 @@ fn register_encoding(ctx: &Ctx<'_>) -> JsResult<()> {
     globals.set("toHex", Function::new(ctx.clone(), to_hex)?)?;
     globals.set("fromHex", Function::new(ctx.clone(), from_hex)?)?;
     globals.set("sha256", Function::new(ctx.clone(), sha256)?)?;
+    // QuickJS ships no TextEncoder/TextDecoder, and the bytes a metadata
+    // section or a file comes back as are usually text.
+    globals.set("encodeUtf8", Function::new(ctx.clone(), encode_utf8)?)?;
+    globals.set("decodeUtf8", Function::new(ctx.clone(), decode_utf8)?)?;
     Ok(())
 }
 
@@ -313,6 +366,15 @@ fn from_hex<'js>(ctx: Ctx<'js>, text: String) -> JsResult<TypedArray<'js, u8>> {
 fn sha256<'js>(ctx: Ctx<'js>, bytes: TypedArray<'js, u8>) -> JsResult<TypedArray<'js, u8>> {
     let digest = Sha256::digest(bytes_of(&ctx, "sha256", &bytes)?);
     TypedArray::new(ctx, digest.to_vec())
+}
+
+fn encode_utf8<'js>(ctx: Ctx<'js>, text: String) -> JsResult<TypedArray<'js, u8>> {
+    TypedArray::new(ctx, text.into_bytes())
+}
+
+fn decode_utf8(ctx: Ctx<'_>, bytes: TypedArray<'_, u8>) -> JsResult<String> {
+    String::from_utf8(bytes_of(&ctx, "decodeUtf8", &bytes)?)
+        .map_err(|e| throw(&ctx, &format!("decodeUtf8 failed: {e}")))
 }
 
 // ---------------------------------------------------------------------------

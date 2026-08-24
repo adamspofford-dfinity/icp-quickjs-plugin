@@ -5,14 +5,17 @@ interface types {
     /// Whether a canister call is an update or a query.
     enum call-type { update, query }
 
-    /// A directory the host preopened on behalf of the plugin.
+    /// A directory the host made readable for the plugin.
     record dir-input {
         /// The map key this directory was declared under in the manifest, or
         /// `none` when `dirs` was written as a plain list. Several entries share
         /// one key when a key maps to a list of directories.
         key: option<string>,
         /// Path of the directory as declared in the manifest (relative to the
-        /// canister directory). The host preopens it at this same path.
+        /// canister directory). It is readable at this same path. Entries may
+        /// repeat a path or name a directory inside another entry's; the host
+        /// preopens each distinct tree once, so such an entry is read through
+        /// the preopen that covers it.
         path: string,
     }
 
@@ -45,13 +48,14 @@ interface types {
         /// The canister's fully-qualified project key: the subproject it belongs
         /// to (a path relative to the app root) joined to its local name by a
         /// single colon, e.g. "services/open-accounts:backend". A canister
-        /// defined directly in the project being synced has no subproject prefix
-        /// and appears as its bare local name, e.g. "backend".
+        /// defined directly in the app root has no subproject prefix and appears
+        /// as its bare local name, e.g. "backend".
         ///
         /// Every canister in the same subproject as the canister being synced is
         /// additionally listed under its bare local name (a duplicate entry with
         /// the same `id`), so a plugin can address a sibling by the same local
-        /// name the manifest uses.
+        /// name the manifest uses. A bare name always means the sibling, so an
+        /// app-root canister sharing that local name is not listed.
         name: string,
         /// Textual principal the name resolves to for this environment.
         id: string,
@@ -59,21 +63,19 @@ interface types {
 
     /// Which canister a `canister-call-request` targets.
     ///
-    /// A plugin may target the canister being synced, or any canister it
-    /// declared as a dependency in the sync step's `canisters` list — by that
-    /// canister's name or by its textual principal. Targeting a canister that
-    /// was not declared as a dependency is rejected by the host.
+    /// A plugin may target the canister being synced, or any canister listed in
+    /// the sync step's `canisters` list — always by that canister's name.
+    /// Targeting a canister that was not listed is rejected by the host.
     variant call-target {
         /// The canister being synced (`sync-exec-input.canister-id`). Always
         /// permitted, whether or not it also appears in `canisters`.
         host,
-        /// A declared-dependency canister identified by name, spelled exactly as
-        /// it appears in `sync-exec-input.canister-ids` — a bare local name for a
-        /// canister in the same subproject, or a `subproject:local` key
-        /// otherwise. The host resolves it against that mapping table.
+        /// A canister from the `canisters` list, identified by name, spelled
+        /// exactly as it appears in `sync-exec-input.canister-ids` — a bare
+        /// local name for a canister in the same subproject, or a
+        /// `subproject:local` key otherwise. The host resolves it against that
+        /// mapping table.
         name(string),
-        /// A declared-dependency canister identified by its textual principal.
-        id(string),
     }
 
     /// Input passed by the runtime to the plugin's exec() export.
@@ -83,8 +85,8 @@ interface types {
         /// Name of the environment being synced (e.g. "production", "local").
         environment: string,
         /// Directories declared in the manifest step's `dirs` setting.
-        /// The host preopens each entry via WASI; the plugin can traverse
-        /// them with standard `wasi:filesystem` (e.g. Rust's `std::fs`).
+        /// The host makes each entry readable via WASI preopens; the plugin
+        /// traverses them with standard `wasi:filesystem` (e.g. Rust's `std::fs`).
         /// Each entry carries the map key it was declared under, if any (see
         /// `dir-input`).
         dirs: list<dir-input>,
@@ -105,15 +107,15 @@ interface types {
         /// the environment being synced, sorted by name. Informational: the
         /// plugin may use it to resolve canister names it knows about. Being
         /// listed here does not grant permission to call a canister — that
-        /// still requires declaring it as a dependency (see `call-target`).
+        /// still requires listing it in `canisters` (see `call-target`).
         canister-ids: list<canister-id-entry>,
     }
 
     /// A request to call a method on a canister.
     record canister-call-request {
         /// Which canister to call. `host` targets the canister being synced;
-        /// `name`/`id` target a canister declared as a dependency in the sync
-        /// step's `canisters` list.
+        /// `name` targets a canister listed in the sync step's `canisters`
+        /// list.
         target: call-target,
         /// The canister method to call.
         method: string,
@@ -134,11 +136,32 @@ interface types {
         /// for query calls.
         cycles: u64,
     }
+
+    /// A request to read a canister's metadata section.
+    record metadata-section-request {
+        /// Which canister to read from. The same rule as
+        /// `canister-call-request.target` applies: `host` is always permitted,
+        /// a `name` must appear in the sync step's `canisters` list.
+        target: call-target,
+        /// Name of the metadata section, as spelled in the wasm module's custom
+        /// section minus the `icp:public `/`icp:private ` prefix — e.g.
+        /// `candid:service`.
+        name: string,
+        /// When true, the section is read straight from the target canister
+        /// with a certified `read_state` request signed by the sync identity,
+        /// which reaches a private section only if that identity controls the
+        /// target. When false (the default), the read is routed through the
+        /// proxy canister configured via `--proxy` — as a call to the
+        /// management canister's `canister_metadata` method, so a private
+        /// section gated on the proxy's control is readable. With no proxy
+        /// configured the read goes directly either way.
+        direct: bool,
+    }
 }
 
 /// The complete interface of a sync plugin.
 world sync-plugin {
-    use types.{sync-exec-input, canister-call-request, call-target, canister-id-entry, dir-input, file-input, field-input};
+    use types.{sync-exec-input, canister-call-request, metadata-section-request, call-target, canister-id-entry, dir-input, file-input, field-input};
 
     // -------------------------------------------------------------------------
     // Host functions (imports) — provided by icp-cli, called by the plugin
@@ -146,12 +169,26 @@ world sync-plugin {
 
     /// Make an update or query call to a canister.
     /// The `req.target` selects the canister: the one being synced (`host`), or
-    /// a canister declared as a dependency in the sync step's `canisters` list,
-    /// by name or principal. A target that was not declared as a dependency is
-    /// rejected without making a call.
+    /// a canister listed in the sync step's `canisters` list, by name. A target
+    /// that was not listed is rejected without making a call.
     /// Returns the raw Candid-encoded response bytes on success or an error
     /// message on failure. The plugin is responsible for decoding.
     import canister-call: func(req: canister-call-request) -> result<list<u8>, string>;
+
+    /// Read a metadata section from a canister.
+    /// The `req.target` selects the canister under the same rule as
+    /// `canister-call`: the canister being synced (`host`), or one listed in
+    /// the sync step's `canisters` list, by name.
+    /// A direct read is a certified `read_state` request signed by the sync
+    /// identity; a proxied read (`direct` false, with `--proxy` configured) is
+    /// a call to the management canister's `canister_metadata` method made by
+    /// the proxy, which reaches sections private to the proxy's control.
+    /// Returns the section's raw bytes on success, or `none` when the target
+    /// provably has no section by that name — including when it has no module
+    /// installed at all, and so no sections. A section the reader may not have
+    /// is an error, as is a canister that does not exist or any other failed
+    /// read. The plugin is responsible for interpreting the bytes.
+    import canister-metadata-section: func(req: metadata-section-request) -> result<option<list<u8>>, string>;
 
     // The plugin's stdout is captured and shown as transient progress in
     // the rolling step view of icp-cli; it is discarded when the step ends.

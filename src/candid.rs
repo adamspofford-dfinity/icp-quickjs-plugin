@@ -18,24 +18,28 @@
 //! What a placeholder cannot stand for is anything the parser resolves while
 //! parsing: a type annotation, a field name, or the contents of a `principal`
 //! or `blob` literal. Those are reported as errors naming the `${…}` at fault.
+//!
+//! The tag yields a [`CandidArgs`], which carries the argument *values* and not
+//! just the bytes they encode to. A call that knows the method's declared types
+//! can then serialize those values against them rather than re-reading bytes
+//! that were written without them.
 
 use std::ops::Range;
 
-use ::candid::types::Label;
-use ::candid::types::value::{IDLArgs, IDLField, IDLValue, VariantValue};
+use ::candid::types::value::{IDLArgs, IDLValue, VariantValue};
 use candid_parser::parse_idl_args;
+use rquickjs::class::{Trace, Tracer};
 use rquickjs::function::Rest;
-use rquickjs::{
-    Array, Class, Coerced, Ctx, FromJs, Function, Object, Result as JsResult, TypedArray, Value,
-};
+use rquickjs::{Class, Ctx, FromJs, Function, JsLifetime, Result as JsResult, TypedArray, Value};
 
+use crate::convert::{self, check_uniform_vecs, js_text, to_candid};
 use crate::engine::{bytes_of, throw};
-use crate::number;
-use crate::principal::Principal;
 
-/// Register the Candid template tag and the textual encode/decode helpers.
+/// Register the Candid template tag, the `CandidArgs` class and the textual
+/// encode/decode helpers.
 pub fn register(ctx: &Ctx<'_>) -> JsResult<()> {
     let globals = ctx.globals();
+    Class::<CandidArgs>::define(&globals)?;
     globals.set("candid", Function::new(ctx.clone(), candid_template)?)?;
     globals.set("candidEncode", Function::new(ctx.clone(), candid_encode)?)?;
     globals.set("candidDecode", Function::new(ctx.clone(), candid_decode)?)?;
@@ -43,17 +47,156 @@ pub fn register(ctx: &Ctx<'_>) -> JsResult<()> {
 }
 
 // ---------------------------------------------------------------------------
+// The argument list
+// ---------------------------------------------------------------------------
+
+/// A Candid argument list: what the `candid` template tag, `candidEncode` and
+/// `CandidInterface.encode` all produce, and what a call takes as its `arg`.
+///
+/// It holds the argument values, not only the bytes they encode to untyped, so
+/// a call against a known interface can serialize them at the types the method
+/// declares — a bare `${7}` lands on a `nat64` where one is wanted. `toString()`
+/// renders the list as Candid text and `toUint8Array()` gives the encoded bytes.
+#[rquickjs::class(rename = "CandidArgs")]
+#[derive(Clone)]
+pub struct CandidArgs {
+    values: Vec<IDLValue>,
+    /// The untyped encoding, computed up front so a malformed argument list is
+    /// reported where it was written rather than where it is used.
+    bytes: Vec<u8>,
+}
+
+/// Holds no JS values, so its GC trace is empty.
+impl<'js> Trace<'js> for CandidArgs {
+    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
+}
+
+// No `'js`-bound state, so the lifetime brand is the identity. See
+// [`crate::principal::Principal`] for why this is written by hand.
+unsafe impl<'js> JsLifetime<'js> for CandidArgs {
+    type Changed<'to> = CandidArgs;
+}
+
+impl CandidArgs {
+    /// Build an argument list from values, checking that it encodes at all.
+    pub fn new(values: Vec<IDLValue>) -> Result<Self, String> {
+        for (index, value) in values.iter().enumerate() {
+            check_uniform_vecs(value, &format!("argument {}", index + 1))?;
+        }
+        let bytes = IDLArgs::new(&values)
+            .to_bytes()
+            .map_err(|e| format!("candid: {e}"))?;
+        Ok(Self { values, bytes })
+    }
+
+    /// Build an argument list from bytes already encoded against known types.
+    pub fn encoded(values: Vec<IDLValue>, bytes: Vec<u8>) -> Self {
+        Self { values, bytes }
+    }
+
+    /// The argument values.
+    pub fn values(&self) -> &[IDLValue] {
+        &self.values
+    }
+
+    /// The encoded bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The one value the list holds, for a `` candid`…` `` written where a
+    /// single value is wanted rather than a whole argument list.
+    pub fn single(&self, path: &str) -> Result<IDLValue, String> {
+        match self.values.as_slice() {
+            [only] => Ok(only.clone()),
+            values => Err(format!(
+                "{path}: a candid`…` template stands for one value here, but this one holds {}; \
+                 write the value on its own",
+                values.len(),
+            )),
+        }
+    }
+}
+
+#[rquickjs::methods]
+impl CandidArgs {
+    /// `new CandidArgs(text)` parses Candid source, the same text
+    /// `candidEncode` takes.
+    #[qjs(constructor)]
+    pub fn parse(ctx: Ctx<'_>, text: String) -> JsResult<Self> {
+        let args = parse_idl_args(&text).map_err(|e| throw(&ctx, &format!("CandidArgs: {e}")))?;
+        Self::new(args.args).map_err(|e| throw(&ctx, &e))
+    }
+
+    /// Read back an encoded argument list. Without type information this is a
+    /// best-effort structural view — record fields come back as their numeric
+    /// hashes — so it is for inspection, not round-tripping.
+    #[qjs(static, rename = "decode")]
+    pub fn decode<'js>(ctx: Ctx<'js>, bytes: Value<'js>) -> JsResult<Self> {
+        let bytes = arg_bytes(&ctx, "CandidArgs.decode", &bytes)?;
+        let args = IDLArgs::from_bytes(&bytes)
+            .map_err(|e| throw(&ctx, &format!("CandidArgs.decode failed: {e}")))?;
+        Ok(Self::encoded(args.args, bytes))
+    }
+
+    /// How many arguments the list holds.
+    #[qjs(get)]
+    pub fn length(&self) -> usize {
+        self.values.len()
+    }
+
+    /// The encoded argument bytes.
+    #[qjs(rename = "toUint8Array")]
+    pub fn to_uint8_array<'js>(&self, ctx: Ctx<'js>) -> JsResult<TypedArray<'js, u8>> {
+        TypedArray::new(ctx, self.bytes.clone())
+    }
+
+    /// The arguments as JavaScript values, one per argument.
+    #[qjs(rename = "toValues")]
+    pub fn to_values<'js>(&self, ctx: Ctx<'js>) -> JsResult<Vec<Value<'js>>> {
+        self.values
+            .iter()
+            .map(|value| convert::to_js(&ctx, value))
+            .collect()
+    }
+
+    /// The argument list as Candid text, e.g. `(42 : nat64, "hi")`.
+    #[qjs(rename = "toString")]
+    pub fn to_string_js(&self) -> String {
+        IDLArgs::new(&self.values).to_string()
+    }
+}
+
+/// The encoded bytes of a value a script offers as argument bytes: a
+/// `CandidArgs`, or a `Uint8Array` of bytes it encoded some other way.
+pub fn arg_bytes<'js>(ctx: &Ctx<'js>, what: &str, value: &Value<'js>) -> JsResult<Vec<u8>> {
+    if let Ok(args) = Class::<CandidArgs>::from_value(value) {
+        return Ok(args.borrow().bytes.clone());
+    }
+    match TypedArray::<u8>::from_value(value.clone()) {
+        Ok(bytes) => bytes_of(ctx, what, &bytes),
+        Err(_) => Err(throw(
+            ctx,
+            &format!(
+                "{what}: expected a Uint8Array or a CandidArgs (e.g. from candid`…`), got {}",
+                convert::type_name(value),
+            ),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The template tag
 // ---------------------------------------------------------------------------
 
 /// `` candid`(…)` `` — Candid source with JavaScript values interpolated,
-/// encoded to argument bytes. The template is an argument *list*, parenthesized
+/// yielding an argument list. The template is an argument *list*, parenthesized
 /// exactly as the text `candidEncode` takes is.
 fn candid_template<'js>(
     ctx: Ctx<'js>,
     strings: Value<'js>,
     values: Rest<Value<'js>>,
-) -> JsResult<TypedArray<'js, u8>> {
+) -> JsResult<CandidArgs> {
     let chunks = template_chunks(&ctx, strings)?;
     if chunks.len() != values.len() + 1 {
         let message = format!(
@@ -64,8 +207,7 @@ fn candid_template<'js>(
         return Err(throw(&ctx, &message));
     }
 
-    let bytes = encode(&ctx, &chunks, &values).map_err(|e| throw(&ctx, &e))?;
-    TypedArray::new(ctx, bytes)
+    build(&ctx, &chunks, &values).map_err(|e| throw(&ctx, &e))
 }
 
 /// The literal chunks of the template, taken raw so a backslash escape means to
@@ -86,12 +228,12 @@ fn template_chunks<'js>(ctx: &Ctx<'js>, strings: Value<'js>) -> JsResult<Vec<Str
 }
 
 /// Parse the template with placeholders standing in for the interpolated
-/// values, graft those values onto the parsed tree, and encode the result.
-fn encode<'js>(
+/// values, and graft those values onto the parsed tree.
+fn build<'js>(
     ctx: &Ctx<'js>,
     chunks: &[String],
     values: &[Value<'js>],
-) -> Result<Vec<u8>, String> {
+) -> Result<CandidArgs, String> {
     let mut holes = Holes::new(chunks, values);
     let source = holes.source(chunks)?;
 
@@ -100,11 +242,7 @@ fn encode<'js>(
         holes.graft(ctx, arg)?;
     }
     holes.check_all_grafted()?;
-    for (index, arg) in args.args.iter().enumerate() {
-        check_uniform_vecs(arg, &format!("argument {}", index + 1))?;
-    }
-
-    args.to_bytes().map_err(|e| format!("candid: {e}"))
+    CandidArgs::new(args.args)
 }
 
 /// The interpolated values of one template, and the placeholders standing in
@@ -306,37 +444,6 @@ impl<'js> Holes<'js> {
     }
 }
 
-/// Reject a `vec` whose elements do not share one Candid type. Without a
-/// declared type a vector takes the type of its first element and every element
-/// is then written as its own, which yields bytes no decoder can read — so a
-/// mixed array is caught here rather than sent.
-fn check_uniform_vecs(value: &IDLValue, path: &str) -> Result<(), String> {
-    match value {
-        IDLValue::Vec(items) => {
-            let expected = items.first().map(IDLValue::value_ty);
-            for (index, item) in items.iter().enumerate() {
-                let found = item.value_ty();
-                if Some(&found) != expected.as_ref() {
-                    return Err(format!(
-                        "candid: {path}[{index}] is {found} but {path}[0] is {}; a vec holds one type",
-                        expected.expect("a first element exists when a later one does"),
-                    ));
-                }
-                check_uniform_vecs(item, &format!("{path}[{index}]"))?;
-            }
-            Ok(())
-        }
-        IDLValue::Opt(inner) => check_uniform_vecs(inner, &format!("{path}?")),
-        IDLValue::Record(fields) => fields
-            .iter()
-            .try_for_each(|field| check_uniform_vecs(&field.val, &format!("{path}.{}", field.id))),
-        IDLValue::Variant(VariantValue(field, _)) => {
-            check_uniform_vecs(&field.val, &format!("{path}.{}", field.id))
-        }
-        _ => Ok(()),
-    }
-}
-
 /// How a hole is named in errors: by the position it was written at, since the
 /// script's own `${…}` has no name to report.
 fn hole_name(index: usize) -> String {
@@ -402,176 +509,24 @@ impl Cursor {
 }
 
 // ---------------------------------------------------------------------------
-// JavaScript values as Candid values
-// ---------------------------------------------------------------------------
-
-/// The Candid value an interpolated JavaScript value stands for.
-///
-/// The mapping is the one Candid's own syntax gives the same literal: an
-/// integer is a width-undetermined number (an `int` unless a type says
-/// otherwise), a fractional number is a `float64`, a string is `text`, an array
-/// is a `vec`, a `Uint8Array` is a `blob`, a `Principal` is a `principal`, and
-/// any other object is a `record`. `null` and `undefined` are Candid's `null`.
-///
-/// `path` names the value in error messages: the hole it came from, extended
-/// with the field or index the offending value sits at.
-fn to_candid<'js>(ctx: &Ctx<'js>, value: &Value<'js>, path: &str) -> Result<IDLValue, String> {
-    if value.is_null() || value.is_undefined() {
-        return Ok(IDLValue::Null);
-    }
-    if let Some(boolean) = value.as_bool() {
-        return Ok(IDLValue::Bool(boolean));
-    }
-    if let Some(number) = value.as_number() {
-        return to_candid_number(number, path);
-    }
-    if value.is_big_int() {
-        // A decimal string of any width: what an integer literal parses to.
-        return Ok(IDLValue::Number(js_text(ctx, value, path)?));
-    }
-    if let Some(text) = value.as_string() {
-        return text
-            .to_string()
-            .map(IDLValue::Text)
-            .map_err(|e| format!("{path}: {e}"));
-    }
-    if let Ok(principal) = Class::<Principal>::from_value(value) {
-        return Ok(IDLValue::Principal(principal.borrow().inner));
-    }
-    // A `Nat32` and friends, which say what an integer's width is.
-    if let Some(number) = number::to_candid(value) {
-        return Ok(number);
-    }
-    if let Some(array) = value.as_array() {
-        return to_candid_vec(ctx, array, path);
-    }
-    if let Some(object) = value.as_object() {
-        if object.is_typed_array::<u8>() {
-            return to_candid_blob(object, path);
-        }
-        if object.as_function().is_some() {
-            return Err(format!("{path} is a function, which has no Candid form"));
-        }
-        return to_candid_record(ctx, object, path);
-    }
-    Err(format!(
-        "{path} is a {}, which has no Candid form",
-        value.type_of(),
-    ))
-}
-
-fn to_candid_number(number: f64, path: &str) -> Result<IDLValue, String> {
-    if !number.is_finite() {
-        return Err(format!("{path} is {number}, which has no Candid form"));
-    }
-    if number.fract() == 0.0 {
-        // Integral, so width-undetermined like a bare integer literal — the
-        // callee's type decides how wide it encodes.
-        return Ok(IDLValue::Number(format!("{number:.0}")));
-    }
-    Ok(IDLValue::Float64(number))
-}
-
-fn to_candid_vec<'js>(ctx: &Ctx<'js>, array: &Array<'js>, path: &str) -> Result<IDLValue, String> {
-    let mut items = Vec::with_capacity(array.len());
-    for (index, item) in array.iter::<Value<'js>>().enumerate() {
-        let path = format!("{path}[{index}]");
-        let item = item.map_err(|e| format!("{path}: {e}"))?;
-        items.push(to_candid(ctx, &item, &path)?);
-    }
-    Ok(IDLValue::Vec(items))
-}
-
-fn to_candid_blob(object: &Object<'_>, path: &str) -> Result<IDLValue, String> {
-    let array =
-        TypedArray::<u8>::from_object(object.clone()).map_err(|e| format!("{path}: {e}"))?;
-    let bytes = array
-        .as_bytes()
-        .ok_or_else(|| format!("{path}: Uint8Array buffer is detached"))?;
-    Ok(IDLValue::Blob(bytes.to_vec()))
-}
-
-fn to_candid_record<'js>(
-    ctx: &Ctx<'js>,
-    object: &Object<'js>,
-    path: &str,
-) -> Result<IDLValue, String> {
-    let mut fields = Vec::new();
-    for property in object.props::<String, Value<'js>>() {
-        let (name, value) = property.map_err(|e| format!("{path}: {e}"))?;
-        let val = to_candid(ctx, &value, &format!("{path}.{name}"))?;
-        fields.push(IDLField {
-            id: Label::Named(name),
-            val,
-        });
-    }
-
-    // A `Map`, a `Set` or a `Date` keeps its contents in internal slots, which
-    // a record reads as nothing at all. An empty record is a plausible thing to
-    // send and an implausible thing to mean by one of those, so say so.
-    if fields.is_empty() && !is_plain_object(ctx, object) {
-        return Err(format!(
-            "{path} is a {} with no properties to read; pass a plain object, an array, a Uint8Array or a Principal",
-            class_name(object).unwrap_or_else(|| "object".to_string()),
-        ));
-    }
-
-    // Hashed-label order, the order the parser leaves a `record { … }` in.
-    fields.sort_unstable_by_key(|field| field.id.get_id());
-    Ok(IDLValue::Record(fields))
-}
-
-/// Whether the object is an object literal — its prototype `Object.prototype`,
-/// or none at all — rather than an instance of some other class.
-fn is_plain_object<'js>(ctx: &Ctx<'js>, object: &Object<'js>) -> bool {
-    let Some(prototype) = object.get_prototype() else {
-        return true;
-    };
-    let base = ctx
-        .globals()
-        .get::<_, Object<'js>>("Object")
-        .and_then(|constructor| constructor.get::<_, Object<'js>>("prototype"));
-    matches!(base, Ok(base) if prototype == base)
-}
-
-/// The name of the class an object was built from, for error messages.
-fn class_name(object: &Object<'_>) -> Option<String> {
-    let constructor = object
-        .get_prototype()?
-        .get::<_, Object<'_>>("constructor")
-        .ok()?;
-    constructor.get::<_, String>("name").ok()
-}
-
-/// A value's JavaScript string form, for a hole inside a string literal — where
-/// the interpolation is textual, and JavaScript's own coercion is the rule.
-fn js_text<'js>(ctx: &Ctx<'js>, value: &Value<'js>, path: &str) -> Result<String, String> {
-    Coerced::<String>::from_js(ctx, value.clone())
-        .map(|coerced| coerced.0)
-        .map_err(|e| format!("{path} cannot be read as text: {e}"))
-}
-
-// ---------------------------------------------------------------------------
 // Textual encode/decode
 // ---------------------------------------------------------------------------
 
-/// Encode a Candid value in text format (e.g. `"(42 : nat64, \"hi\")"`) to
-/// argument bytes. Number literals default to `int`/`nat`; annotate them
-/// (`42 : nat64`) when the method signature needs a specific width.
-fn candid_encode<'js>(ctx: Ctx<'js>, text: String) -> JsResult<TypedArray<'js, u8>> {
+/// Encode a Candid value in text format (e.g. `"(42 : nat64, \"hi\")"`) to an
+/// argument list. Number literals default to `int`/`nat`; annotate them
+/// (`42 : nat64`) when the method signature needs a specific width and the call
+/// does not already know it.
+fn candid_encode(ctx: Ctx<'_>, text: String) -> JsResult<CandidArgs> {
     let args =
         parse_idl_args(&text).map_err(|e| throw(&ctx, &format!("candidEncode failed: {e}")))?;
-    let bytes = args
-        .to_bytes()
-        .map_err(|e| throw(&ctx, &format!("candidEncode failed: {e}")))?;
-    TypedArray::new(ctx, bytes)
+    CandidArgs::new(args.args).map_err(|e| throw(&ctx, &e))
 }
 
 /// Decode Candid argument bytes back to their text representation. Without a
 /// type it reconstructs a best-effort structural view, which is enough for
 /// inspecting responses in a script.
-fn candid_decode<'js>(ctx: Ctx<'js>, bytes: TypedArray<'js, u8>) -> JsResult<String> {
-    let bytes = bytes_of(&ctx, "candidDecode", &bytes)?;
+fn candid_decode<'js>(ctx: Ctx<'js>, bytes: Value<'js>) -> JsResult<String> {
+    let bytes = arg_bytes(&ctx, "candidDecode", &bytes)?;
     IDLArgs::from_bytes(&bytes)
         .map(|args| args.to_string())
         .map_err(|e| throw(&ctx, &format!("candidDecode failed: {e}")))
@@ -585,9 +540,10 @@ mod tests {
     /// argument list spelled out as Candid source does.
     const SAME: &str = r#"
         function same(label, actual, expected) {
-            const want = candidEncode(expected);
-            if (toHex(actual) !== toHex(want)) {
-                throw label + ": " + candidDecode(actual) + " is not " + candidDecode(want);
+            const got = toHex(actual.toUint8Array());
+            const want = toHex(candidEncode(expected).toUint8Array());
+            if (got !== want) {
+                throw label + ": " + actual + " is not " + expected;
             }
         }
     "#;
@@ -664,6 +620,46 @@ mod tests {
     }
 
     #[test]
+    fn an_exact_class_encodes_as_the_value_it_names() {
+        eval(&format!(
+            r#"{SAME}
+            same("unit variant", candid`(${{new Variant("ok")}})`, "(variant {{ ok }})");
+            same("payload variant", candid`(${{new Variant("ok", 5)}})`, "(variant {{ ok = 5 }})");
+            same("hashed tag", candid`(${{new Variant("_24860_", 5)}})`, "(variant {{ ok = 5 }})");
+            same("present opt", candid`(${{new Opt(5)}})`, "(opt 5)");
+            same("absent opt", candid`(${{new Opt()}})`, "(null : opt empty)");
+            same("opt null", candid`(${{new Opt(null)}})`, "(opt null)");
+            same("nested opt", candid`(${{new Opt(new Opt("x"))}})`, '(opt opt "x")');
+            same("service", candid`(${{new Service("aaaaa-aa")}})`, '(service "aaaaa-aa")');
+            same("func", candid`(${{new Func(canister, "go")}})`, `(func "${{canisterId}}".go)`);
+            same("tuple", candid`(${{new Tuple("x", new Nat32(7))}})`, '(record {{ "x"; 7 : nat32 }})');
+
+            // Read back as Candid text, and the accessors each class carries.
+            if (`${{new Variant("ok", 5)}}` !== "variant {{ ok = 5 }}") throw "variant toString";
+            if (new Variant("ok").tag !== "ok") throw "tag";
+            if (new Opt(1).hasValue !== true || new Opt().hasValue !== false) throw "hasValue";
+            if (new Service("aaaaa-aa").canister.toText() !== "aaaaa-aa") throw "canister";
+            if (new Func("aaaaa-aa", "go").method !== "go") throw "method";
+            if (new Tuple(1, 2, 3).length !== 3) throw "length";
+            "#
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn an_exact_class_rejects_what_it_cannot_hold() {
+        let service = error("new Service(7);");
+        assert!(
+            service.contains("Service: expected a Principal or its text"),
+            "{service}"
+        );
+        let func = error("new Func('nope', 'go');");
+        assert!(func.contains("'nope' is not a principal"), "{func}");
+        let variant = error("new Variant('ok', () => 1);");
+        assert!(variant.contains("Variant('ok') is a function"), "{variant}");
+    }
+
+    #[test]
     fn a_hole_can_stand_anywhere_a_value_can() {
         eval(&format!(
             r#"{SAME}
@@ -672,9 +668,17 @@ mod tests {
             same("opt", candid`(opt ${{5}})`, "(opt 5)");
             same("variant", candid`(variant {{ ok = ${{5}} }})`, "(variant {{ ok = 5 }})");
             same("two args", candid`(${{1}}, ${{"x"}})`, '(1, "x")');
+            // A one-value template stands for that value where a value is wanted.
+            same("nested template", candid`(record {{ a = ${{candid`(5)`}} }})`, "(record {{ a = 5 }})");
             "#
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn a_multi_value_template_cannot_stand_for_one_value() {
+        let two = error("candid`(record { a = ${candid`(1, 2)`} })`;");
+        assert!(two.contains("stands for one value here"), "{two}");
     }
 
     #[test]
@@ -743,6 +747,7 @@ mod tests {
         let infinite = error("candid`(${1 / 0})`;");
         assert!(infinite.contains("${…} #1 is inf"), "{infinite}");
     }
+
     #[test]
     fn a_mixed_array_is_an_error() {
         // Untyped encoding would produce bytes no decoder can read.
@@ -766,5 +771,30 @@ mod tests {
 
         // An object literal, empty or not, is still a record.
         eval("candid`(${{}})`; candid`(${Object.create(null)})`;").unwrap();
+    }
+
+    #[test]
+    fn an_argument_list_reads_back() {
+        crate::testing::assert_script(&[
+            ("length", "candid`(1, \"x\")`.length === 2"),
+            ("toString", "`${candid`(1, \"x\")`}` === '(1, \"x\")'"),
+            (
+                "toUint8Array",
+                "candid`()`.toUint8Array() instanceof Uint8Array",
+            ),
+            ("toValues", "candid`(1, \"x\")`.toValues()[1] === 'x'"),
+            (
+                "decode",
+                "CandidArgs.decode(candid`(7 : nat64)`).toValues()[0] === 7n",
+            ),
+            (
+                "constructor",
+                "`${new CandidArgs('(7 : nat64)')}` === '(7 : nat64)'",
+            ),
+            (
+                "candidDecode takes either",
+                "candidDecode(candid`(1 : nat8)`) === candidDecode(candid`(1 : nat8)`.toUint8Array())",
+            ),
+        ]);
     }
 }

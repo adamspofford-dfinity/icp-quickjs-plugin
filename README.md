@@ -4,8 +4,9 @@ An [icp-cli](https://github.com/dfinity/icp-cli) **sync plugin** that runs a
 JavaScript script against the canister being synced. It implements the
 `icp:sync-plugin` WIT world (see [`sync-plugin.wit`](sync-plugin.wit)) and
 exposes to the script roughly the same capabilities a native sync plugin has —
-calling the target canister, the sync inputs, and read-only filesystem access —
-plus Candid, principal, and encoding helpers convenient for canister work.
+calling the target canister, reading its metadata, the sync inputs, and read-only
+filesystem access — plus Candid, principal, and encoding helpers convenient for
+canister work.
 
 Scripts run on [QuickJS](https://bellard.org/quickjs/) via
 [rquickjs](https://crates.io/crates/rquickjs); it is a small ES2020-class engine
@@ -86,21 +87,23 @@ let seeds = fileKeys.seed.map((path) => files[path]);
 (both `subproject:local` keys and bare local names for same-subproject siblings)
 to its textual principal for the environment being synced. Being listed does not
 grant permission to call a canister — that still requires declaring it in the
-step's `canisters:` list. Wrap a value in `Principal.from(..)` for a
-`Principal`, or pass it straight to a call's `target`.
+step's `canisters:` list. Wrap a value in `Principal.from(..)` for a `Principal`.
 
 ### Canister calls
 
-By default a call targets the canister being synced (`canisterId`). A call may
-instead target any canister declared as a dependency in the sync step's
-`canisters:` list, via the `target` field (see below). Each call returns the raw
-Candid-encoded response bytes as a `Uint8Array`, or throws with the host's error
-message.
+By default a call targets the canister being synced (`canisterId`), which the
+global `self` also names explicitly. A call may instead target any canister
+listed in the sync step's `canisters:`, via the `target` field — **by name**,
+spelled exactly as that list does. A principal is not a target: the host resolves
+names so that the permission it checks is the one the manifest granted, and
+passing one is an error that names the canister instead. Each call returns the
+raw Candid-encoded response bytes as a `Uint8Array`, or throws with the host's
+error message.
 
 ```js
 // Shorthands: empty-arg style is just candid`()`.
 // The first two always target the canister being synced; `callOther` makes an
-// update call to a canister declared in `canisters:`, by name.
+// update call to a canister listed in `canisters:`, by name.
 let resp = callQuery("get_count", candid`()`);
 let resp = callUpdate("set_count", candid`(7 : nat64)`);
 let resp = callOther("ledger", "set_count", candid`(7 : nat64)`);
@@ -112,12 +115,40 @@ let resp = canisterCall({
     query: false,   // default false → update; true → query
     direct: false,  // default false → route update through the proxy if configured
     cycles: 0,      // attached to a proxied update call only
-    // target: omitted → the canister being synced. A string that parses as a
-    // principal (or a Principal value) targets by id; any other string targets
-    // by canister name. The target must be declared in `canisters:`.
+    // target: `self` (or omitted) → the canister being synced. Otherwise the
+    // name of a canister listed in the step's `canisters:`.
     target: "ledger",
 });
 ```
+
+`arg` takes a `CandidArgs` — what the `candid` tag yields — or a `Uint8Array` of
+bytes encoded some other way.
+
+These are the raw calls: the script encodes the argument and decodes the
+response itself. [Coerced calls](#coerced-calls) do both against the callee's own
+interface instead.
+
+### Metadata sections
+
+```js
+let did = canisterMetadata("candid:service"); // → Uint8Array, or null if absent
+let text = decodeUtf8(did);
+
+// General form. Only `name` is required.
+let section = canisterMetadata({
+    name: "candid:args",
+    target: "ledger", // omitted → the canister being synced
+    direct: false,    // default false → read through the proxy if configured
+});
+```
+
+The section name is spelled as the wasm module's custom section does, minus the
+`icp:public `/`icp:private ` prefix. `null` means the target provably has no
+section by that name — including having no module installed at all; a section the
+reader may not have is an error. A `direct` read is a certified `read_state`
+signed by the sync identity, which reaches a private section only if that
+identity controls the target; a proxied read reaches one private to the proxy's
+control.
 
 ### Candid
 
@@ -125,8 +156,8 @@ An argument is written as Candid source with JavaScript values interpolated
 into it, using the `candid` template tag:
 
 ```js
-let bytes = candid`(record { to = ${dest}; amount = ${10} })`;
-let bytes = candid`(${[1, 2, 3]}, "literal text")`; // → Uint8Array of arguments
+let args = candid`(record { to = ${dest}; amount = ${10} })`;
+let args = candid`(${[1, 2, 3]}, "literal text")`; // → CandidArgs
 ```
 
 The template is an argument *list*, parenthesized like the text `candidEncode`
@@ -148,6 +179,7 @@ literal:
 | a `Principal`             | `principal`                                    |
 | a `Uint8Array`            | `blob`                                         |
 | a number class            | that class's type (see below)                  |
+| an exact-encoding class   | that class's value (see below)                 |
 | an array                  | `vec` (its elements must share one type)       |
 | any other object          | `record` of its own enumerable properties      |
 
@@ -160,11 +192,31 @@ annotation (`${n} : nat64`), a field name, or the contents of a `principal` or
 literal out, or interpolate the whole value (`${Principal.from(id)}` rather than
 `principal "${id}"`).
 
+#### `CandidArgs`
+
+An argument list, and what a call's `arg` takes. It carries the argument
+*values*, not only the bytes they encode to untyped, which is what lets a
+[coerced call](#coerced-calls) serialize them at the types the callee declares.
+
+```js
+let args = candid`(1, "x")`;
+args.length;         // → 2
+args.toUint8Array(); // → Uint8Array of encoded bytes
+args.toValues();     // → [1n, "x"], the arguments as JavaScript values
+`${args}`;           // → '(1, "x")', the list as Candid text
+
+new CandidArgs('(42 : nat64)');   // parse Candid source, as candidEncode does
+CandidArgs.decode(bytes);          // read back encoded bytes, untyped
+```
+
+A one-value `` candid`…` `` also stands for that one value wherever a value is
+wanted — a record field, or one argument of a coerced call.
+
 Candid text can also be encoded and decoded directly:
 
 ```js
-let bytes = candidEncode('(42 : nat64, "hi")'); // text → Uint8Array
-let text  = candidDecode(bytes);                 // Uint8Array → text (best-effort)
+let args = candidEncode('(42 : nat64, "hi")'); // text → CandidArgs
+let text = candidDecode(args);                  // CandidArgs/Uint8Array → text
 ```
 
 `candidDecode` reconstructs a structural view without type information, so
@@ -187,6 +239,133 @@ Each takes a number, a `BigInt` or a string — so a `nat64` past 2^53 stays
 exact, `new Nat64("18446744073709551615")` — and throws when the value does not
 fit. They are wrappers for encoding: `toString()` reads one back, and in a
 string a hole holding one interpolates its decimal.
+
+### Exact-encoding classes
+
+The literal mapping covers what JavaScript syntax denotes. What is left over —
+a variant, a canister or function reference, an optional distinct from `null`,
+and a tuple of mixed types — has a class that says it exactly:
+
+```js
+new Variant("ok");                       // variant { ok }
+new Variant("member", { since: 1 });     // variant { member = record { since = 1 } }
+new Opt(5);                              // opt 5
+new Opt();                               // an absent optional
+new Service(canister);                   // service "…"
+new Func(canister, "transfer");          // func "…".transfer
+new Tuple("x", new Nat32(7));            // record { "x"; 7 : nat32 }
+```
+
+`Variant` reads its tag the way a Candid field name is read: `_123_` is the hash
+itself, anything else is hashed. `Opt` is for the two cases the coercion rules
+cannot spell — an optional holding `null` (`new Opt(null)`) and an optional of an
+optional. `Service` and `Func` take a `Principal` or its text. `Tuple` is a
+record of numbered fields, which an array cannot be because a `vec` holds one
+type.
+
+Each carries the accessors its shape suggests (`.tag`, `.hasValue`, `.canister`,
+`.method`, `.length`) and a `toString()` that renders the value as Candid text.
+
+### Coerced calls
+
+A script that knows what a method's arguments *are* need not write any Candid:
+the types the callee declares decide how each JavaScript value encodes, and how
+the response reads back. The interface comes from the receiver itself, out of its
+`candid:service` metadata section.
+
+```js
+callTyped("ledger", "transfer", { to: dest, amount: 10 });
+
+const balance = callTyped("ledger", "balance_of", identity); // → decoded JavaScript
+```
+
+The first argument is the receiver: a canister name as a call's `target` is, or
+**`self`** for the canister being synced. A target is otherwise always a name,
+and the canister being synced has none to give — so `self` is the global that
+names it.
+
+```js
+callTyped(self, "increment");
+```
+
+The interface decides whether each call is a query or an update, and is read
+once per receiver per run rather than once per call. A method with one result
+returns it directly, one with none returns `undefined`, and one with several
+returns an array.
+
+The general form takes the options a raw `canisterCall` does, plus an
+`interface` to use instead of the one read from the receiver:
+
+```js
+canisterCallTyped({
+    method: "transfer",
+    args: [{ to: dest, amount: 10 }], // the argument list; omitted → no arguments
+    target: "ledger",                  // omitted → the canister being synced
+    interface: files["ledger.did"],    // a CandidInterface, or `.did` source
+    direct: false,
+    cycles: 0,
+});
+```
+
+`args` is the argument *list*, so a method taking one `vec` gets
+`args: [[1, 2, 3]]`. A `` candid`…` `` may stand for the whole list instead of an
+array.
+
+`CandidInterface` is the parsed `.did` on its own, for encoding and decoding
+without calling:
+
+```js
+const iface = new CandidInterface(files["backend.did"]);
+const iface = CandidInterface.fromCanister("ledger"); // read from its metadata
+const iface = CandidInterface.fromCanister(self);
+
+iface.methods();                      // → string[]
+iface.signature("get");               // → "(nat64) -> (text) query"
+iface.isQuery("get");                 // → boolean
+iface.encode("transfer", { … });      // → CandidArgs, at the declared types
+iface.decodeResult("transfer", resp); // → decoded JavaScript
+iface.decodeArgs("transfer", bytes);  // → an array, one per declared argument
+```
+
+#### What coerces to what
+
+Every rule is there to make a JavaScript *literal* land on the type the method
+declares. A value the declared type cannot account for is an error naming the
+argument and the field it sits at — never a guess.
+
+| Declared type                | JavaScript                                                  |
+| ---------------------------- | ----------------------------------------------------------- |
+| `bool`                       | a boolean                                                    |
+| `text`                       | a string                                                     |
+| `nat`, `int`, any fixed width | an integral number, or a `BigInt`                           |
+| `float32`, `float64`         | a number                                                     |
+| `principal`                  | a `Principal`, or a textual principal                        |
+| `service`                    | a `Principal`, a textual principal, or a `Service`           |
+| `func`                       | a `Func` — no literal denotes one                            |
+| `opt T`                      | `null`/`undefined` for absent, anything else for present     |
+| `vec T`                      | an array; a `Uint8Array` where `T` is `nat8`                 |
+| `record`                     | an object keyed by field name; an array for a tuple record   |
+| `variant`                    | `{ tag: value }`, or `"tag"` for a tag that carries nothing  |
+| `null`                       | `null` or `undefined`                                        |
+| `reserved`                   | anything                                                     |
+
+An omitted record field is absent where the type says `opt`, `null` or
+`reserved`, and an error otherwise; an unknown field is an error rather than
+something dropped on the floor. A string is *not* a number — `BigInt` is how
+JavaScript writes an integer too wide for a number, so there is nothing a decimal
+string could add.
+
+A value one of the exact-encoding or number classes holds passes through as it
+stands, as does a `` candid`…` `` — which supplies the whole argument list when
+it is a call's only argument, and one value where a single value is wanted.
+
+Decoded results are the same mapping read backwards, so a response goes straight
+back into another call: a record is an object keyed by field name, a variant is a
+one-entry object, `principal` and `service` are `Principal`s, `func` is a `Func`,
+`blob` is a `Uint8Array`, and an absent optional is `null`. `nat`, `int`, `nat64`
+and `int64` come back as `BigInt`s, being wider than a number is exact for; the
+narrower widths and the floats are numbers. `opt null` and nested optionals are
+what this loses — `candidDecode` shows a response exactly.
 
 ### Principals
 
@@ -222,13 +401,19 @@ constructor protected.
 ### Encoding helpers
 
 ```js
-toHex(bytes);         // Uint8Array → hex string
-fromHex("deadbeef");  // hex string → Uint8Array
+toHex(bytes);          // Uint8Array → hex string
+fromHex("deadbeef");   // hex string → Uint8Array
 sha256(bytes);         // Uint8Array → 32-byte Uint8Array
+encodeUtf8("hi");      // string → Uint8Array
+decodeUtf8(bytes);     // Uint8Array → string (throws on invalid UTF-8)
 ```
 
+QuickJS ships no `TextEncoder`/`TextDecoder`, hence the last two — the bytes a
+metadata section comes back as are usually text.
+
 JSON is built into JavaScript — use `JSON.parse` / `JSON.stringify` directly;
-there is no `jsonDecode` / `jsonEncode` helper.
+there is no `jsonDecode` / `jsonEncode` helper. Note that `JSON.stringify`
+refuses a `BigInt`, which a decoded `nat`/`int`/`nat64`/`int64` is.
 
 ### Filesystem
 
@@ -266,14 +451,20 @@ const authorized = config.authorized.map((p) => Principal.from(p));
 callOther("example", "set_authorized", candid`(${authorized})`);
 ```
 
+Or the same call written against the canister's own interface, which turns the
+strings into principals itself:
+
+```js
+const config = JSON.parse(files["config.json"]);
+callTyped("example", "set_authorized", config.authorized);
+```
+
 Bump a counter and report the new value:
 
 ```js
-let before = candidDecode(callQuery("get", candid`()`));
-console.error("count before sync: " + before);
+console.error("count before sync: " + callTyped(self, "get"));
 
-callUpdate("increment", candid`()`);
+callTyped(self, "increment");
 
-let after = candidDecode(callQuery("get", candid`()`));
-console.error("count after sync: " + after);
+console.error("count after sync: " + callTyped(self, "get"));
 ```
