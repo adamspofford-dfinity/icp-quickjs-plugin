@@ -160,8 +160,8 @@ let args = candid`(record { to = ${dest}; amount = ${10} })`;
 let args = candid`(${[1, 2, 3]}, "literal text")`; // → CandidArgs
 ```
 
-The template is an argument *list*, parenthesized like the text `candidEncode`
-takes. Interpolation is not textual: each `${…}` is parsed as a placeholder and
+The template is an argument *list*, parenthesized like the text
+`new CandidArgs(text)` takes. Interpolation is not textual: each `${…}` is parsed as a placeholder and
 the JavaScript value is grafted onto the parsed value afterwards, so a value can
 never inject Candid syntax of its own — `${"1; b = 2"}` is one `text` value, not
 a record field.
@@ -205,18 +205,23 @@ args.toUint8Array(); // → Uint8Array of encoded bytes
 args.toValues();     // → [1n, "x"], the arguments as JavaScript values
 `${args}`;           // → '(1, "x")', the list as Candid text
 
-new CandidArgs('(42 : nat64)');   // parse Candid source, as candidEncode does
+new CandidArgs('(42 : nat64)');    // parse an argument list from Candid source
 CandidArgs.decode(bytes);          // read back encoded bytes, untyped
 ```
 
 A one-value `` candid`…` `` also stands for that one value wherever a value is
 wanted — a record field, or one argument of a coerced call.
 
-Candid text can also be encoded and decoded directly:
+An argument list can also be built from JavaScript values alone, with no source
+to write: `candidEncode` takes one value per argument and converts each exactly
+as a `${…}` hole is converted, by the table above.
 
 ```js
-let args = candidEncode('(42 : nat64, "hi")'); // text → CandidArgs
-let text = candidDecode(args);                  // CandidArgs/Uint8Array → text
+let args = candidEncode({ to: dest, amount: 10 }); // → CandidArgs, one record
+let args = candidEncode(1, 'hi');                  // → CandidArgs, two arguments
+candidEncode('(42)');                              // → ('(42)'), a text value —
+                                                   //   source is CandidArgs' job
+let text = candidDecode(args);                     // CandidArgs/Uint8Array → text
 ```
 
 `candidDecode` reconstructs a structural view without type information, so

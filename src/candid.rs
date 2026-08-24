@@ -120,8 +120,8 @@ impl CandidArgs {
 
 #[rquickjs::methods]
 impl CandidArgs {
-    /// `new CandidArgs(text)` parses Candid source, the same text
-    /// `candidEncode` takes.
+    /// `new CandidArgs(text)` parses Candid source — an argument list written
+    /// out in full, the textual counterpart of `candidEncode`'s values.
     #[qjs(constructor)]
     pub fn parse(ctx: Ctx<'_>, text: String) -> JsResult<Self> {
         let args = parse_idl_args(&text).map_err(|e| throw(&ctx, &format!("CandidArgs: {e}")))?;
@@ -191,7 +191,7 @@ pub fn arg_bytes<'js>(ctx: &Ctx<'js>, what: &str, value: &Value<'js>) -> JsResul
 
 /// `` candid`(…)` `` — Candid source with JavaScript values interpolated,
 /// yielding an argument list. The template is an argument *list*, parenthesized
-/// exactly as the text `candidEncode` takes is.
+/// exactly as the text `new CandidArgs(text)` takes is.
 fn candid_template<'js>(
     ctx: Ctx<'js>,
     strings: Value<'js>,
@@ -512,14 +512,25 @@ impl Cursor {
 // Textual encode/decode
 // ---------------------------------------------------------------------------
 
-/// Encode a Candid value in text format (e.g. `"(42 : nat64, \"hi\")"`) to an
-/// argument list. Number literals default to `int`/`nat`; annotate them
-/// (`42 : nat64`) when the method signature needs a specific width and the call
-/// does not already know it.
-fn candid_encode(ctx: Ctx<'_>, text: String) -> JsResult<CandidArgs> {
-    let args =
-        parse_idl_args(&text).map_err(|e| throw(&ctx, &format!("candidEncode failed: {e}")))?;
-    CandidArgs::new(args.args).map_err(|e| throw(&ctx, &e))
+/// `candidEncode(value, …)` — one JavaScript value per Candid argument,
+/// converted with no type to go on, exactly as a `` candid`…` `` placeholder
+/// is: an integer is width-undetermined, a fractional number is a `float64`, a
+/// string is `text`, an array is a `vec`, a `Uint8Array` is a `blob`, and any
+/// other object is a `record`. The wrappers of [`crate::exact`] and
+/// [`crate::number`] say what no literal can.
+///
+/// Candid *source* is what `new CandidArgs(text)` takes; a string here is a
+/// `text` value, not a list to parse.
+fn candid_encode<'js>(ctx: Ctx<'js>, values: Rest<Value<'js>>) -> JsResult<CandidArgs> {
+    let values = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            to_candid(&ctx, value, &format!("candidEncode argument {}", index + 1))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| throw(&ctx, &e))?;
+    CandidArgs::new(values).map_err(|e| throw(&ctx, &e))
 }
 
 /// Decode Candid argument bytes back to their text representation. Without a
@@ -541,7 +552,7 @@ mod tests {
     const SAME: &str = r#"
         function same(label, actual, expected) {
             const got = toHex(actual.toUint8Array());
-            const want = toHex(candidEncode(expected).toUint8Array());
+            const want = toHex(new CandidArgs(expected).toUint8Array());
             if (got !== want) {
                 throw label + ": " + actual + " is not " + expected;
             }
@@ -796,5 +807,50 @@ mod tests {
                 "candidDecode(candid`(1 : nat8)`) === candidDecode(candid`(1 : nat8)`.toUint8Array())",
             ),
         ]);
+    }
+
+    #[test]
+    fn candid_encode_converts_its_arguments() {
+        crate::testing::assert_script(&[
+            // One argument per value, each converted as a hole standing in the
+            // same position is.
+            (
+                "several values",
+                "`${candidEncode(1, 'hi')}` === `${candid`(${1}, ${'hi'})`}`",
+            ),
+            (
+                "a record",
+                "`${candidEncode({ amount: 10 })}` === `${candid`(${{ amount: 10 }})`}`",
+            ),
+            (
+                "a number class",
+                "`${candidEncode(new Nat64(7))}` === `${candid`(7 : nat64)`}`",
+            ),
+            (
+                "a one-value template",
+                "`${candidEncode(candid`(7 : nat64)`)}` === `${candid`(7 : nat64)`}`",
+            ),
+            ("no values", "candidEncode().length === 0"),
+            // Source is `new CandidArgs(text)`'s job: a string is a text value.
+            (
+                "a string is text",
+                "candidEncode('(42)').toValues()[0] === '(42)'",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn candid_encode_names_the_argument_at_fault() {
+        let function = error("candidEncode(1, () => 1);");
+        assert!(
+            function.contains("candidEncode argument 2 is a function"),
+            "{function}"
+        );
+
+        let nested = error("candidEncode({ amount: () => 1 });");
+        assert!(
+            nested.contains("candidEncode argument 1.amount is a function"),
+            "{nested}"
+        );
     }
 }
