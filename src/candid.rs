@@ -551,8 +551,8 @@ mod tests {
     /// argument list spelled out as Candid source does.
     const SAME: &str = r#"
         function same(label, actual, expected) {
-            const got = toHex(actual.toUint8Array());
-            const want = toHex(new CandidArgs(expected).toUint8Array());
+            const got = actual.toUint8Array().toHex();
+            const want = new CandidArgs(expected).toUint8Array().toHex();
             if (got !== want) {
                 throw label + ": " + actual + " is not " + expected;
             }

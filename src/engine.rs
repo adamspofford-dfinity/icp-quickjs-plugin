@@ -5,7 +5,8 @@
 use ::candid::Principal as CandidPrincipal;
 use rquickjs::function::{Opt as OptArg, Rest};
 use rquickjs::{
-    Class, Coerced, Ctx, Exception, FromJs, Function, Object, Result as JsResult, TypedArray, Value,
+    Class, Coerced, Ctx, Exception, FromJs, Function, Object, Persistent, Result as JsResult,
+    TypedArray, Value,
 };
 use sha2::{Digest, Sha256};
 
@@ -34,11 +35,125 @@ pub fn run(input: SyncExecInput) -> Result<(), String> {
     let context = rquickjs::Context::full(&runtime)
         .map_err(|e| format!("failed to build JS context: {e}"))?;
 
+    let rejections = context
+        .with(RejectionLog::install)
+        .map_err(|e| format!("failed to install the promise rejection tracker: {e}"))?;
+    let tracked = rejections.clone();
+    runtime.set_host_promise_rejection_tracker(Some(Box::new(
+        move |ctx, promise, reason, is_handled| tracked.track(&ctx, promise, reason, is_handled),
+    )));
+
     context.with(|ctx| {
         install(&ctx, &input).map_err(|e| describe_error(&ctx, e))?;
         ctx.eval::<(), _>(script_src.as_bytes())
             .map_err(|e| format!("{script_name}: {}", describe_error(&ctx, e)))
-    })
+    })?;
+
+    run_jobs(&runtime, &script_name)?;
+    context.with(|ctx| rejections.into_result(&ctx, &script_name))
+}
+
+// ---------------------------------------------------------------------------
+// Promise jobs. The script runs to completion first, but the promises it made
+// have not: QuickJS queues every `.then` callback, every `queueMicrotask` and
+// every resumption of an `await` as a job, and runs none of them on its own.
+// So the step is over only once the queue has drained — and a rejection nobody
+// handled is the step's error, since the work it stood for did not happen.
+// ---------------------------------------------------------------------------
+
+/// Run every queued job, and every job those queue in turn, until none is left.
+///
+/// A job that throws outright — a `queueMicrotask` callback, say, which has no
+/// promise to reject — leaves its exception pending on the context it ran in,
+/// and fails the step with it.
+fn run_jobs(runtime: &rquickjs::Runtime, script_name: &str) -> Result<(), String> {
+    loop {
+        match runtime.execute_pending_job() {
+            Ok(true) => continue,
+            Ok(false) => return Ok(()),
+            Err(exception) => {
+                let reported = exception
+                    .0
+                    .with(|ctx| describe_error(&ctx, rquickjs::Error::Exception));
+                return Err(format!("{script_name}: {reported}"));
+            }
+        }
+    }
+}
+
+/// The rejected promises nothing has handled, kept as a JS-side `Map` from the
+/// promise to the reason it was rejected with.
+///
+/// QuickJS reports a rejection the moment it happens, before a handler that
+/// arrives in a later job could have been attached, and reports that late
+/// handler separately — so the two reports have to be matched up by promise,
+/// and matching them means the engine's own notion of object identity. A `Map`
+/// keyed by the promise is that identity, and holding the log in JavaScript
+/// keeps it out of reach of the script, which never sees this object.
+#[derive(Clone)]
+struct RejectionLog(Persistent<Object<'static>>);
+
+impl RejectionLog {
+    fn install(ctx: Ctx<'_>) -> JsResult<Self> {
+        let log: Object<'_> = ctx.eval(
+            br#"(() => {
+                const pending = new Map();
+                return {
+                    rejected: (promise, reason) => { pending.set(promise, reason); },
+                    handled: (promise) => { pending.delete(promise); },
+                    unhandled: () => [...pending.values()],
+                };
+            })()"#,
+        )?;
+        Ok(Self(Persistent::save(&ctx, log)))
+    }
+
+    /// Record a rejection, or forget one that turned out to be handled after
+    /// all. The reason is rendered here rather than kept as a value, so the log
+    /// holds what the error message will say and nothing that can change under
+    /// it afterwards.
+    fn track<'js>(&self, ctx: &Ctx<'js>, promise: Value<'js>, reason: Value<'js>, handled: bool) {
+        let Ok(log) = self.0.clone().restore(ctx) else {
+            return;
+        };
+        let recorded = if handled {
+            log.get::<_, Function<'js>>("handled")
+                .and_then(|f| f.call::<_, ()>((promise,)))
+        } else {
+            let reason = describe_value(ctx, reason);
+            log.get::<_, Function<'js>>("rejected")
+                .and_then(|f| f.call::<_, ()>((promise, reason)))
+        };
+        // The log is ours and its calls cannot throw, so a failure here means
+        // the engine is already unwinding — and this callback has no way to
+        // report it that would not itself be swallowed.
+        let _ = recorded;
+    }
+
+    /// The step's result: an error naming what was rejected and never handled,
+    /// or `Ok(())` when nothing was.
+    fn into_result(self, ctx: &Ctx<'_>, script_name: &str) -> Result<(), String> {
+        let reasons = self
+            .0
+            .restore(ctx)
+            .and_then(|log| {
+                log.get::<_, Function<'_>>("unhandled")?
+                    .call::<_, Vec<String>>(())
+            })
+            .unwrap_or_default();
+
+        match reasons.as_slice() {
+            [] => Ok(()),
+            [only] => Err(format!(
+                "{script_name}: unhandled promise rejection: {only}"
+            )),
+            many => Err(format!(
+                "{script_name}: {} unhandled promise rejections: {}",
+                many.len(),
+                many.join("; "),
+            )),
+        }
+    }
 }
 
 /// Resolve the entry script to a `(name for error messages, source)` pair.
@@ -83,6 +198,7 @@ fn install(ctx: &Ctx<'_>, input: &SyncExecInput) -> JsResult<()> {
     candid::register(ctx)?;
     interface::register(ctx)?;
     register_encoding(ctx)?;
+    register_random(ctx)?;
     fs::register(ctx)?;
     inject_inputs(ctx, input)?;
     Ok(())
@@ -325,28 +441,20 @@ fn name_hint(ctx: &Ctx<'_>, principal: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Encoding helpers. (JSON is native in JS — use JSON.parse / JSON.stringify.)
+// Encoding helpers, for what the engine itself has no answer to. JSON is native
+// (`JSON.parse`/`JSON.stringify`), and so are hex and base64 — a `Uint8Array`
+// carries `toHex()`/`toBase64()`, with `Uint8Array.fromHex(..)`/`fromBase64(..)`
+// to read them back.
 // ---------------------------------------------------------------------------
 
 fn register_encoding(ctx: &Ctx<'_>) -> JsResult<()> {
     let globals = ctx.globals();
-    globals.set("toHex", Function::new(ctx.clone(), to_hex)?)?;
-    globals.set("fromHex", Function::new(ctx.clone(), from_hex)?)?;
     globals.set("sha256", Function::new(ctx.clone(), sha256)?)?;
     // QuickJS ships no TextEncoder/TextDecoder, and the bytes a metadata
     // section or a file comes back as are usually text.
     globals.set("encodeUtf8", Function::new(ctx.clone(), encode_utf8)?)?;
     globals.set("decodeUtf8", Function::new(ctx.clone(), decode_utf8)?)?;
     Ok(())
-}
-
-fn to_hex(ctx: Ctx<'_>, bytes: TypedArray<'_, u8>) -> JsResult<String> {
-    Ok(hex::encode(bytes_of(&ctx, "toHex", &bytes)?))
-}
-
-fn from_hex<'js>(ctx: Ctx<'js>, text: String) -> JsResult<TypedArray<'js, u8>> {
-    let bytes = hex::decode(&text).map_err(|e| throw(&ctx, &format!("fromHex failed: {e}")))?;
-    TypedArray::new(ctx, bytes)
 }
 
 fn sha256<'js>(ctx: Ctx<'js>, bytes: TypedArray<'js, u8>) -> JsResult<TypedArray<'js, u8>> {
@@ -361,6 +469,45 @@ fn encode_utf8<'js>(ctx: Ctx<'js>, text: String) -> JsResult<TypedArray<'js, u8>
 fn decode_utf8(ctx: Ctx<'_>, bytes: TypedArray<'_, u8>) -> JsResult<String> {
     String::from_utf8(bytes_of(&ctx, "decodeUtf8", &bytes)?)
         .map_err(|e| throw(&ctx, &format!("decodeUtf8 failed: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// Randomness, from the host's `wasi:random`. `Math.random` is QuickJS's own
+// PRNG, seeded from the clock and fine for a sample or a jitter; this is the
+// host's cryptographic randomness, for a nonce, a salt or a subaccount that
+// has to be unguessable.
+// ---------------------------------------------------------------------------
+
+/// The most bytes one call will produce. Nothing a script needs randomness for
+/// is anywhere near this large, so a bigger request is a mistake worth naming
+/// rather than an allocation worth making.
+const MAX_RANDOM_BYTES: f64 = 1024.0 * 1024.0;
+
+fn register_random(ctx: &Ctx<'_>) -> JsResult<()> {
+    ctx.globals()
+        .set("randomBytes", Function::new(ctx.clone(), random_bytes)?)
+}
+
+/// `randomBytes(count)` — `count` cryptographically random bytes.
+fn random_bytes<'js>(ctx: Ctx<'js>, count: f64) -> JsResult<TypedArray<'js, u8>> {
+    if !count.is_finite() || count.fract() != 0.0 || count < 0.0 {
+        return Err(throw(
+            &ctx,
+            &format!("randomBytes: expected a whole number of bytes, got {count}"),
+        ));
+    }
+    if count > MAX_RANDOM_BYTES {
+        return Err(throw(
+            &ctx,
+            &format!(
+                "randomBytes: {count} bytes is more than the {MAX_RANDOM_BYTES} this returns at once"
+            ),
+        ));
+    }
+
+    let mut bytes = vec![0u8; count as usize];
+    getrandom::fill(&mut bytes).map_err(|e| throw(&ctx, &format!("randomBytes failed: {e}")))?;
+    TypedArray::new(ctx, bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -501,7 +648,13 @@ fn describe_error(ctx: &Ctx<'_>, err: rquickjs::Error) -> String {
     if !err.is_exception() {
         return err.to_string();
     }
-    let value = ctx.catch();
+    describe_value(ctx, ctx.catch())
+}
+
+/// Render a thrown or rejected value: an `Error`'s message and stack when it is
+/// one, and whatever the value coerces to otherwise, since a script may throw
+/// or reject with anything at all.
+fn describe_value<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> String {
     if let Some(exception) = value.clone().into_exception() {
         return exception.to_string();
     }
@@ -668,5 +821,99 @@ mod tests {
         let err = run(input("throw 'nope';")).unwrap_err();
         assert!(err.contains("sync.js"), "{err}");
         assert!(err.contains("nope"), "{err}");
+    }
+
+    /// The step is not over when the script's last statement is: what a script
+    /// queued has to run too, or the work it stands for silently never happens.
+    #[test]
+    fn queued_jobs_run_before_the_step_ends() {
+        let reported = crate::testing::error(
+            "queueMicrotask(() => { throw new Error('the microtask ran'); });",
+        );
+        assert!(reported.contains("the microtask ran"), "{reported}");
+    }
+
+    /// An `await` resumes in a job of its own, so the rest of an async function
+    /// runs only if the queue drains to the end.
+    ///
+    /// The check has to be made from inside a job, and a job has no way to
+    /// report success — so it reports which of the two outcomes it saw by
+    /// throwing it, and the test reads that back as the step's error.
+    #[test]
+    fn an_await_resumes_before_the_step_ends() {
+        let reported = crate::testing::error(
+            "let resumed = false;
+             (async () => { await null; resumed = true; })();
+             queueMicrotask(() => { throw resumed ? 'resumed' : 'never resumed'; });",
+        );
+        assert!(reported.contains("resumed"), "{reported}");
+        assert!(!reported.contains("never resumed"), "{reported}");
+    }
+
+    #[test]
+    fn an_unhandled_rejection_fails_the_step() {
+        for (script, expected) in [
+            (
+                "(async () => { await null; throw 'after the await'; })();",
+                "unhandled promise rejection: after the await",
+            ),
+            (
+                "Promise.reject(new Error('rejected outright'));",
+                "rejected outright",
+            ),
+            (
+                "Promise.resolve().then(() => { throw 'from a then'; });",
+                "unhandled promise rejection: from a then",
+            ),
+            (
+                "Promise.reject('one'); Promise.reject('two');",
+                "2 unhandled promise rejections: one; two",
+            ),
+        ] {
+            let reported = crate::testing::error(script);
+            assert!(reported.contains(expected), "{script}\n{reported}");
+        }
+    }
+
+    /// A rejection someone handles is not the step's problem — including one
+    /// whose handler is attached in a later job, which QuickJS reports as
+    /// unhandled first and thinks better of afterwards.
+    #[test]
+    fn a_handled_rejection_leaves_the_step_alone() {
+        for script in [
+            "Promise.reject('caught').catch(() => {});",
+            "(async () => { try { await Promise.reject('caught'); } catch (e) {} })();",
+            "Promise.resolve().then(() => { throw 'caught'; }).catch(() => {});",
+            "const p = Promise.reject('late'); queueMicrotask(() => p.catch(() => {}));",
+        ] {
+            crate::testing::eval(script).unwrap_or_else(|e| panic!("{script}\n{e}"));
+        }
+    }
+
+    #[test]
+    fn random_bytes_are_random_bytes() {
+        crate::testing::assert_script(&[
+            ("length", "randomBytes(32).length === 32"),
+            ("type", "randomBytes(1) instanceof Uint8Array"),
+            ("none", "randomBytes(0).length === 0"),
+            // Two 16-byte draws colliding is not something to plan around.
+            (
+                "distinct",
+                "randomBytes(16).toHex() !== randomBytes(16).toHex()",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn random_bytes_takes_a_whole_count_it_can_answer() {
+        for (script, expected) in [
+            ("randomBytes(-1);", "expected a whole number of bytes"),
+            ("randomBytes(1.5);", "expected a whole number of bytes"),
+            ("randomBytes(NaN);", "expected a whole number of bytes"),
+            ("randomBytes(2 ** 30);", "more than the"),
+        ] {
+            let reported = crate::testing::error(script);
+            assert!(reported.contains(expected), "{script}\n{reported}");
+        }
     }
 }

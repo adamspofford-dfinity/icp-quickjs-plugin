@@ -259,7 +259,7 @@ mod tests {
             ),
             (
                 "toHex",
-                "toHex(canister.toUint8Array()) === canister.toHex()",
+                "canister.toUint8Array().toHex() === canister.toHex()",
             ),
             (
                 "round trip",

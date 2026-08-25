@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 candid = "0.10"
 candid_parser = "0.4"
+getrandom = "0.4"
 hex = "0.4"
 rquickjs = { version = "0.12", default-features = false, features = [
     "macro",

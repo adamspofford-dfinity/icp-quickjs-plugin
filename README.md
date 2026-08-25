@@ -55,6 +55,14 @@ its key, which the script reads back through `fileKeys` / `dirKeys`.
 A script runs to completion for a clean sync; throwing (or a runtime error)
 fails the step with the thrown message.
 
+Promises have no event loop under them. `async`/`await`, `.then` and
+`queueMicrotask` queue jobs, which run after the script's last statement until
+the queue is empty — that is when the step ends. A rejection nothing handled
+fails the step, so a `throw` inside an async function is as fatal as one at the
+top level, and a promise that never settles leaves the rest of its function
+unrun. Canister calls are synchronous, so nothing suspends but what the script
+suspends itself.
+
 ## Scripting API
 
 ### Sync inputs (globals)
@@ -367,9 +375,10 @@ Decoded results are the same mapping read backwards, so a response goes straight
 back into another call: a record is an object keyed by field name, a variant is a
 one-entry object, `principal` and `service` are `Principal`s, `func` is a `Func`,
 `blob` is a `Uint8Array`, and an absent optional is `null`. `nat`, `int`, `nat64`
-and `int64` come back as `BigInt`s, being wider than a number is exact for; the
-narrower widths and the floats are numbers. `opt null` and nested optionals are
-what this loses — `candidDecode` shows a response exactly.
+and `int64` come back as `BigInt`s, being wider than a number is exact for, which
+`JSON.stringify` refuses; the narrower widths and the floats are numbers. `opt
+null` and nested optionals are what this loses — `candidDecode` shows a response
+exactly.
 
 ### Principals
 
@@ -405,19 +414,24 @@ constructor protected.
 ### Encoding helpers
 
 ```js
-toHex(bytes);          // Uint8Array → hex string
-fromHex("deadbeef");   // hex string → Uint8Array
 sha256(bytes);         // Uint8Array → 32-byte Uint8Array
 encodeUtf8("hi");      // string → Uint8Array
 decodeUtf8(bytes);     // Uint8Array → string (throws on invalid UTF-8)
 ```
 
-QuickJS ships no `TextEncoder`/`TextDecoder`, hence the last two — the bytes a
-metadata section comes back as are usually text.
+The bytes a metadata section or a file comes back as are usually text, which is
+what the last two are for.
 
-JSON is built into JavaScript — use `JSON.parse` / `JSON.stringify` directly;
-there is no `jsonDecode` / `jsonEncode` helper. Note that `JSON.stringify`
-refuses a `BigInt`, which a decoded `nat`/`int`/`nat64`/`int64` is.
+### Randomness
+
+```js
+randomBytes(32); // → Uint8Array of 32 cryptographically random bytes
+```
+
+The bytes come from the host's `wasi:random`, so they are unguessable — for a
+nonce, a salt, or a fresh subaccount. `Math.random()` is a clock-seeded PRNG:
+fine for jitter or a sample, not for anything that must not be predicted. One
+call returns at most 1 MiB.
 
 ### Filesystem
 
@@ -440,11 +454,11 @@ joinPath("assets", "img", "a.png");  // → "assets/img/a.png"
 ```
 
 `readDir` yields entry *names*, without the directory they sit in — `joinPath`
-puts the two back together. It hands back an iterator rather than an array, so
-`for … of` walks it and `[...readDir(dir)]` or `Array.from` collects it; like
-any iterator it is consumed once. The names are read and sorted when `readDir`
-is called, so an unreadable directory fails there rather than partway through
-the loop, and a walk does the same work in the same order on every run.
+puts the two back together. The `DirEntries` it returns is an iterator: `for … of`
+walks it, `[...readDir(dir)]` or `Array.from` collects it, and it is consumed
+once. The names are read and sorted when `readDir` is called, so an unreadable
+directory fails there rather than partway through the loop, and a walk does the
+same work in the same order on every run.
 
 ```js
 for (const name of readDir("assets")) {
