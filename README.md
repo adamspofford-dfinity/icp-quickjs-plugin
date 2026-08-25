@@ -91,9 +91,9 @@ step's `canisters:` list. Wrap a value in `Principal.from(..)` for a `Principal`
 
 ### Canister calls
 
-By default a call targets the canister being synced (`canisterId`), which the
-global `self` also names explicitly. A call may instead target any canister
-listed in the sync step's `canisters:`, via the `target` field — **by name**,
+Every call names its receiver: the global `self` is the canister being synced
+(`canisterId`), which is also what an omitted `target` means. A call may instead
+target any canister listed in the sync step's `canisters:` — **by name**,
 spelled exactly as that list does. A principal is not a target: the host resolves
 names so that the permission it checks is the one the manifest granted, and
 passing one is an error that names the canister instead. Each call returns the
@@ -101,12 +101,11 @@ raw Candid-encoded response bytes as a `Uint8Array`, or throws with the host's
 error message.
 
 ```js
-// Shorthands: empty-arg style is just candid`()`.
-// The first two always target the canister being synced; `callOther` makes an
-// update call to a canister listed in `canisters:`, by name.
-let resp = callQuery("get_count", candid`()`);
-let resp = callUpdate("set_count", candid`(7 : nat64)`);
-let resp = callOther("ledger", "set_count", candid`(7 : nat64)`);
+// Shorthands: the receiver first, then the method, then the argument list —
+// which may be omitted where the method takes none.
+let resp = callQuery(self, "get_count");
+let resp = callUpdate(self, "set_count", candid`(7 : nat64)`);
+let resp = callUpdate("ledger", "set_count", candid`(7 : nat64)`);
 
 // General form. Only `method` is required.
 let resp = canisterCall({
@@ -453,7 +452,7 @@ const config = JSON.parse(files["config.json"]);
 // wrapped in `Principal.from(..)`, which both validates them and tells the encoder
 // they are principals rather than text.
 const authorized = config.authorized.map((p) => Principal.from(p));
-callOther("example", "set_authorized", candid`(${authorized})`);
+callUpdate("example", "set_authorized", candid`(${authorized})`);
 ```
 
 Or the same call written against the canister's own interface, which turns the

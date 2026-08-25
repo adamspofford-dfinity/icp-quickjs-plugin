@@ -3,7 +3,7 @@
 //! filesystem access over WASI, and Candid/principal/encoding helpers.
 
 use ::candid::Principal as CandidPrincipal;
-use rquickjs::function::Rest;
+use rquickjs::function::{Opt as OptArg, Rest};
 use rquickjs::{
     Class, Coerced, Ctx, Exception, FromJs, Function, Object, Result as JsResult, TypedArray, Value,
 };
@@ -128,8 +128,7 @@ fn join_args(args: Rest<Coerced<String>>) -> String {
 // Canister calls
 // ---------------------------------------------------------------------------
 
-/// Register `canisterCall` and its `callUpdate` / `callQuery` / `callOther`
-/// shorthands.
+/// Register `canisterCall` and its `callUpdate` / `callQuery` shorthands.
 fn register_canister_calls(ctx: &Ctx<'_>) -> JsResult<()> {
     let globals = ctx.globals();
     globals.set(
@@ -138,7 +137,6 @@ fn register_canister_calls(ctx: &Ctx<'_>) -> JsResult<()> {
     )?;
     globals.set("callUpdate", Function::new(ctx.clone(), call_update_js)?)?;
     globals.set("callQuery", Function::new(ctx.clone(), call_query_js)?)?;
-    globals.set("callOther", Function::new(ctx.clone(), call_other_js)?)?;
     Ok(())
 }
 
@@ -172,58 +170,46 @@ fn canister_call_js<'js>(ctx: Ctx<'js>, opts: Object<'js>) -> JsResult<TypedArra
     host_call(&ctx, target, method, arg, call_type, direct, cycles)
 }
 
+/// `callUpdate(receiver, method, arg)` — an update call to the receiver, which
+/// is `self` or the name of a canister listed in the step's `canisters:`, as a
+/// coerced call's is. `arg` is optional, and omitted is an empty argument list.
 fn call_update_js<'js>(
     ctx: Ctx<'js>,
+    receiver: Value<'js>,
     method: String,
-    arg: Value<'js>,
+    arg: OptArg<Value<'js>>,
 ) -> JsResult<TypedArray<'js, u8>> {
-    let arg = arg_bytes(&ctx, "callUpdate `arg`", &arg)?;
-    host_call(
-        &ctx,
-        CallTarget::Host,
-        method,
-        arg,
-        CallType::Update,
-        false,
-        0,
-    )
+    shorthand_call(&ctx, "callUpdate", receiver, method, arg, CallType::Update)
 }
 
+/// `callQuery(receiver, method, arg)` — the query form of [`call_update_js`].
 fn call_query_js<'js>(
     ctx: Ctx<'js>,
+    receiver: Value<'js>,
     method: String,
-    arg: Value<'js>,
+    arg: OptArg<Value<'js>>,
 ) -> JsResult<TypedArray<'js, u8>> {
-    let arg = arg_bytes(&ctx, "callQuery `arg`", &arg)?;
-    host_call(
-        &ctx,
-        CallTarget::Host,
-        method,
-        arg,
-        CallType::Query,
-        false,
-        0,
-    )
+    shorthand_call(&ctx, "callQuery", receiver, method, arg, CallType::Query)
 }
 
-/// An update call to another canister listed in the sync step's `canisters:`,
-/// by the name the manifest spells it with.
-fn call_other_js<'js>(
-    ctx: Ctx<'js>,
-    name: String,
+/// What the two shorthands share: resolve the receiver, read the argument, and
+/// make the call with the defaults `canisterCall` would apply.
+fn shorthand_call<'js>(
+    ctx: &Ctx<'js>,
+    what: &str,
+    receiver: Value<'js>,
     method: String,
-    arg: Value<'js>,
+    arg: OptArg<Value<'js>>,
+    call_type: CallType,
 ) -> JsResult<TypedArray<'js, u8>> {
-    let arg = arg_bytes(&ctx, "callOther `arg`", &arg)?;
-    host_call(
-        &ctx,
-        CallTarget::Name(name),
-        method,
-        arg,
-        CallType::Update,
-        false,
-        0,
-    )
+    let (target, _) = resolve_target(ctx, Some(&receiver), what)?;
+    let arg = match arg.0 {
+        Some(arg) if !arg.is_null() && !arg.is_undefined() => {
+            arg_bytes(ctx, &format!("{what} `arg`"), &arg)?
+        }
+        _ => Vec::new(),
+    };
+    host_call(ctx, target, method, arg, call_type, false, 0)
 }
 
 /// Invoke the host `canister-call` import, mapping its error string into a JS
@@ -689,6 +675,31 @@ mod tests {
         let mut input = input("");
         input.files.retain(|f| f.key.as_deref() != Some("script"));
         assert!(run(input).unwrap_err().contains("no script provided"));
+    }
+
+    /// A shorthand names its receiver first, the way a coerced call does. A
+    /// call needs a host to answer it, so what a test can reach is what the
+    /// shorthand does before that: resolving the receiver and reading the
+    /// argument.
+    #[test]
+    fn a_shorthand_names_its_receiver_first() {
+        for (script, expected) in [
+            (
+                "callUpdate('ryjl3-tyaaa-aaaaa-aaaba-cai', 'go', candid`()`);",
+                "callUpdate: a target is `self` or the name of a canister listed",
+            ),
+            (
+                "callQuery(7, 'go');",
+                "callQuery: a target is `self` or the name of a canister listed",
+            ),
+            (
+                "callUpdate(self, 'go', 'nope');",
+                "callUpdate `arg`: expected a Uint8Array or a CandidArgs",
+            ),
+        ] {
+            let reported = crate::testing::error(script);
+            assert!(reported.contains(expected), "{script}\n{reported}");
+        }
     }
 
     #[test]
