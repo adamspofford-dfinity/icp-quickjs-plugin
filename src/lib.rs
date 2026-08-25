@@ -18,6 +18,7 @@ mod candid;
 mod convert;
 mod engine;
 mod exact;
+mod fs;
 mod interface;
 mod number;
 mod principal;

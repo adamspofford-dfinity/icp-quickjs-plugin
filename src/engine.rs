@@ -15,7 +15,7 @@ use crate::icp::sync_plugin::types::{CallTarget, CallType};
 use crate::interface::SelfTarget;
 use crate::principal::{self, Principal};
 use crate::{CanisterCallRequest, SyncExecInput, canister_call};
-use crate::{exact, interface, number};
+use crate::{exact, fs, interface, number};
 
 /// Run the entry script with all capabilities wired in. Returns the plugin's
 /// `exec` result: `Ok(())` on a clean run, or a human-readable error string on
@@ -83,7 +83,7 @@ fn install(ctx: &Ctx<'_>, input: &SyncExecInput) -> JsResult<()> {
     candid::register(ctx)?;
     interface::register(ctx)?;
     register_encoding(ctx)?;
-    register_fs(ctx)?;
+    fs::register(ctx)?;
     inject_inputs(ctx, input)?;
     Ok(())
 }
@@ -361,45 +361,6 @@ fn encode_utf8<'js>(ctx: Ctx<'js>, text: String) -> JsResult<TypedArray<'js, u8>
 fn decode_utf8(ctx: Ctx<'_>, bytes: TypedArray<'_, u8>) -> JsResult<String> {
     String::from_utf8(bytes_of(&ctx, "decodeUtf8", &bytes)?)
         .map_err(|e| throw(&ctx, &format!("decodeUtf8 failed: {e}")))
-}
-
-// ---------------------------------------------------------------------------
-// Filesystem: read-only access to the preopened `dirs` over WASI. QuickJS has
-// no filesystem of its own, so we expose plain read helpers backed by std::fs;
-// writes fail because the host preopens directories read-only.
-// ---------------------------------------------------------------------------
-
-fn register_fs(ctx: &Ctx<'_>) -> JsResult<()> {
-    let globals = ctx.globals();
-    globals.set("readFile", Function::new(ctx.clone(), read_file)?)?;
-    globals.set(
-        "readFileBytes",
-        Function::new(ctx.clone(), read_file_bytes)?,
-    )?;
-    globals.set("readDir", Function::new(ctx.clone(), read_dir)?)?;
-    Ok(())
-}
-
-fn read_file(ctx: Ctx<'_>, path: String) -> JsResult<String> {
-    std::fs::read_to_string(&path)
-        .map_err(|e| throw(&ctx, &format!("readFile('{path}') failed: {e}")))
-}
-
-fn read_file_bytes<'js>(ctx: Ctx<'js>, path: String) -> JsResult<TypedArray<'js, u8>> {
-    let bytes = std::fs::read(&path)
-        .map_err(|e| throw(&ctx, &format!("readFileBytes('{path}') failed: {e}")))?;
-    TypedArray::new(ctx, bytes)
-}
-
-fn read_dir(ctx: Ctx<'_>, path: String) -> JsResult<Vec<String>> {
-    let entries = std::fs::read_dir(&path)
-        .map_err(|e| throw(&ctx, &format!("readDir('{path}') failed: {e}")))?;
-    let mut names = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| throw(&ctx, &format!("readDir('{path}') failed: {e}")))?;
-        names.push(entry.file_name().to_string_lossy().into_owned());
-    }
-    Ok(names)
 }
 
 // ---------------------------------------------------------------------------

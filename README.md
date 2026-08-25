@@ -421,16 +421,51 @@ refuses a `BigInt`, which a decoded `nat`/`int`/`nat64`/`int64` is.
 
 ### Filesystem
 
-Read-only access to the preopened `dirs`, backed by WASI. Paths are relative to
-a preopened directory.
+Read-only access to the directories the step declared under `dirs:`, backed by
+WASI. Each is readable at the path the manifest declared it at, and nothing
+outside them is readable at all.
 
 ```js
-let text  = readFile("assets/data.json");        // → string (UTF-8)
-let bytes = readFileBytes("assets/logo.png");    // → Uint8Array
-let names = readDir("assets");                    // → string[] of entry names
+readFile("assets/data.json");        // → string (throws if not valid UTF-8)
+readFileBytes("assets/logo.png");    // → Uint8Array
+readDir("assets");                   // → DirEntries, an iterator of entry names
+
+exists("assets/data.json");          // → boolean
+isFile("assets/data.json");          // → boolean
+isDir("assets");                     // → boolean
+isSymlink("assets/current");         // → boolean, about the link itself
+fileSize("assets/logo.png");         // → number of bytes
+
+joinPath("assets", "img", "a.png");  // → "assets/img/a.png"
 ```
 
-Writes are unavailable because the host preopens directories read-only.
+`readDir` yields entry *names*, without the directory they sit in — `joinPath`
+puts the two back together. It hands back an iterator rather than an array, so
+`for … of` walks it and `[...readDir(dir)]` or `Array.from` collects it; like
+any iterator it is consumed once. The names are read and sorted when `readDir`
+is called, so an unreadable directory fails there rather than partway through
+the loop, and a walk does the same work in the same order on every run.
+
+```js
+for (const name of readDir("assets")) {
+    const path = joinPath("assets", name);
+    if (isFile(path)) print(path, fileSize(path));
+}
+```
+
+The reads throw with the underlying error; the predicates answer `false`
+instead, so a path that may not be there — or may not be reachable — can be
+asked about. Since only the declared `dirs:` are readable, a failed read also
+says what the step declared, and a path naming a declared *file* says to read it
+from `files`: the host passes those contents inline rather than putting them on
+the filesystem.
+
+`joinPath` separates the parts it is given with single slashes however they are
+punctuated, dropping empty ones. A part that starts at the root replaces what
+came before it, the way pushing onto a path does.
+
+Writes are unavailable because the host preopens directories read-only; a script
+that has something to hand back makes a canister call with it.
 
 ### Output
 
