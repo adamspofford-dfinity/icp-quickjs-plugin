@@ -2,8 +2,9 @@
 //! being synced.
 //!
 //! The plugin exposes to the script the same capabilities a native sync plugin
-//! has — calling the target canister, reading its metadata sections, the sync
-//! inputs, and read-only filesystem access to the manifest's `dirs` — plus
+//! has — calling the target canister, reading its metadata sections, setting its
+//! environment variables, the sync inputs, and read-only filesystem access to
+//! the manifest's `dirs` — plus
 //! Candid, principal, and encoding helpers convenient for canister work. See
 //! [`engine`] for the wiring, [`candid`] for how an argument is written, and
 //! [`interface`] for calling a method by name against the types the callee

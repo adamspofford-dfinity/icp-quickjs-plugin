@@ -1,6 +1,7 @@
 //! Builds the QuickJS context the plugin runs scripts on, wiring in every
-//! capability a sync plugin has: canister calls, the sync inputs, read-only
-//! filesystem access over WASI, and Candid/principal/encoding helpers.
+//! capability a sync plugin has: canister calls, environment variable updates,
+//! the sync inputs, read-only filesystem access over WASI, and
+//! Candid/principal/encoding helpers.
 
 use ::candid::Principal as CandidPrincipal;
 use rquickjs::function::{Opt as OptArg, Rest};
@@ -15,7 +16,10 @@ use crate::convert;
 use crate::icp::sync_plugin::types::{CallTarget, CallType};
 use crate::interface::SelfTarget;
 use crate::principal::{self, Principal};
-use crate::{CanisterCallRequest, SyncExecInput, canister_call};
+use crate::{
+    CanisterCallRequest, SetEnvironmentVariableRequest, SyncExecInput, canister_call,
+    canister_set_environment_variable,
+};
 use crate::{exact, fs, interface, number};
 
 /// Run the entry script with all capabilities wired in. Returns the plugin's
@@ -195,6 +199,7 @@ fn install(ctx: &Ctx<'_>, input: &SyncExecInput) -> JsResult<()> {
     exact::register(ctx)?;
     register_output(ctx)?;
     register_canister_calls(ctx)?;
+    register_environment(ctx)?;
     candid::register(ctx)?;
     interface::register(ctx)?;
     register_encoding(ctx)?;
@@ -437,6 +442,100 @@ fn name_hint(ctx: &Ctx<'_>, principal: &str) -> String {
     match found {
         Some((name, _)) => format!("; the project calls that canister '{name}'"),
         None => String::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Canister environment variables
+// ---------------------------------------------------------------------------
+
+/// Register `canisterSetenv`.
+fn register_environment(ctx: &Ctx<'_>) -> JsResult<()> {
+    ctx.globals().set(
+        "canisterSetenv",
+        Function::new(ctx.clone(), canister_setenv_js)?,
+    )
+}
+
+/// `canisterSetenv(receiver, name, value, options)` — the receiver first, the
+/// way a call shorthand names its own.
+///
+/// Sets one of the receiver's runtime environment variables, leaving its other
+/// variables — and the rest of its settings — as they are. The receiver is
+/// `self` or the name of a canister listed in the step's `canisters:` (see
+/// [`resolve_target`]). The options are `{ direct }` and may be omitted or
+/// `null`; `direct` is false by default, which lets the proxy make the update
+/// when one is configured.
+fn canister_setenv_js<'js>(
+    ctx: Ctx<'js>,
+    receiver: Value<'js>,
+    name: String,
+    value: Value<'js>,
+    options: OptArg<Value<'js>>,
+) -> JsResult<()> {
+    let (target, _) = resolve_target(&ctx, Some(&receiver), "canisterSetenv")?;
+    let value = setenv_value(&ctx, &value)?;
+    let direct = setenv_direct(&ctx, options)?;
+
+    let req = SetEnvironmentVariableRequest {
+        target,
+        name,
+        value,
+        direct,
+    };
+    canister_set_environment_variable(&req)
+        .map_err(|e| throw(&ctx, &format!("canisterSetenv failed: {e}")))
+}
+
+/// The trailing options, whose one field is `direct`. Everything else about the
+/// update is positional, so a field this does not know is a mistake worth naming
+/// rather than a setting silently dropped.
+fn setenv_direct<'js>(ctx: &Ctx<'js>, options: OptArg<Value<'js>>) -> JsResult<bool> {
+    let Some(options) = options.0.filter(|v| !v.is_null() && !v.is_undefined()) else {
+        return Ok(false);
+    };
+    let Some(options) = options.as_object() else {
+        return Err(throw(
+            ctx,
+            &format!(
+                "canisterSetenv: options are an object with a `direct` field, got {}",
+                convert::type_name(&options),
+            ),
+        ));
+    };
+
+    let unknown: Vec<String> = options
+        .keys::<String>()
+        .flatten()
+        .filter(|key| key != "direct")
+        .map(|key| format!("`{key}`"))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(throw(
+            ctx,
+            &format!(
+                "canisterSetenv: `direct` is the only option, got {}",
+                unknown.join(", "),
+            ),
+        ));
+    }
+    Ok(options.get::<_, Option<bool>>("direct")?.unwrap_or(false))
+}
+
+/// The value to set, which is a string: the canister reads the variable back
+/// verbatim, so how a value that is not one renders is the script's to say
+/// rather than a coercion's to guess.
+fn setenv_value<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> JsResult<String> {
+    match value.as_string() {
+        Some(text) => text.to_string(),
+        None => Err(throw(
+            ctx,
+            &format!(
+                "canisterSetenv: a value is a string, got {}; convert it first — `String(x)`, or \
+                 `x.toText()` for a Principal",
+                convert::type_name(value),
+            ),
+        )),
     }
 }
 
@@ -809,6 +908,33 @@ mod tests {
             (
                 "callUpdate(self, 'go', 'nope');",
                 "callUpdate `arg`: expected a Uint8Array or a CandidArgs",
+            ),
+        ] {
+            let reported = crate::testing::error(script);
+            assert!(reported.contains(expected), "{script}\n{reported}");
+        }
+    }
+
+    /// `canisterSetenv` names its receiver first too. The update needs a host
+    /// to make it, so what a test reaches is the checking that precedes it.
+    #[test]
+    fn setenv_names_its_receiver_first() {
+        for (script, expected) in [
+            (
+                "canisterSetenv('ryjl3-tyaaa-aaaaa-aaaba-cai', 'SEEDED_BY', 'local');",
+                "canisterSetenv: a target is `self` or the name of a canister listed",
+            ),
+            (
+                "canisterSetenv(self, 'SEEDED_BY', 7);",
+                "canisterSetenv: a value is a string, got a number",
+            ),
+            (
+                "canisterSetenv(self, 'SEEDED_BY', undefined);",
+                "canisterSetenv: a value is a string, got undefined",
+            ),
+            (
+                "canisterSetenv(self, 'SEEDED_BY', 'local', { target: 'ledger' });",
+                "canisterSetenv: `direct` is the only option, got `target`",
             ),
         ] {
             let reported = crate::testing::error(script);

@@ -4,9 +4,9 @@ An [icp-cli](https://github.com/dfinity/icp-cli) **sync plugin** that runs a
 JavaScript script against the canister being synced. It implements the
 `icp:sync-plugin` WIT world (see [`sync-plugin.wit`](sync-plugin.wit)) and
 exposes to the script roughly the same capabilities a native sync plugin has —
-calling the target canister, reading its metadata, the sync inputs, and read-only
-filesystem access — plus Candid, principal, and encoding helpers convenient for
-canister work.
+calling the target canister, reading its metadata, setting its environment
+variables, the sync inputs, and read-only filesystem access — plus Candid,
+principal, and encoding helpers convenient for canister work.
 
 Scripts run on [QuickJS](https://bellard.org/quickjs/) via
 [rquickjs](https://crates.io/crates/rquickjs); it is a small ES2020-class engine
@@ -156,6 +156,35 @@ reader may not have is an error. A `direct` read is a certified `read_state`
 signed by the sync identity, which reaches a private section only if that
 identity controls the target; a proxied read reaches one private to the proxy's
 control.
+
+### Environment variables
+
+`canisterSetenv` sets one of a canister's runtime environment variables, leaving
+its other variables — and the rest of its settings — as they are. It names its
+receiver first, as a call shorthand does.
+
+```js
+canisterSetenv(self, "SEEDED_BY", environment);
+canisterSetenv("ledger", "ADMIN", canisterIds.backend);
+
+// Optional trailing options; `direct` is the only one.
+canisterSetenv(self, "ADMIN", identityId, { direct: true });
+```
+
+The value is a string: the canister reads it back verbatim, so anything else is
+the script's to render (`String(x)`, or `x.toText()` for a `Principal`). The
+update is controller-gated — with `direct` the sync identity must control the
+receiver, and by default the proxy configured via `--proxy` makes it, so that is
+what must control it. With no proxy configured the sync identity signs either
+way.
+
+Set the variable on every sync rather than once. The management canister can only
+replace a canister's variables as a whole list, so the host reads them and writes
+them back with yours added — and a later `icp deploy` rewrites that list from the
+manifest, dropping what a plugin added. Deploy runs the sync phase afterwards, so
+a script that always sets it always restores it. For a variable that should not
+depend on the plugin running, declare it in the manifest's
+`environment_variables` setting instead.
 
 ### Candid
 
